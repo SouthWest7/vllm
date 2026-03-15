@@ -53,8 +53,6 @@ if TYPE_CHECKING:
     VLLM_CPU_SGL_KERNEL: bool = False
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
-    VLLM_FUSED_MOE_CHUNK_SIZE: int = 16 * 1024
-    VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING: bool = True
     VLLM_FUSED_MOE_USE_DIRECT_CALL: bool | None = None
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -822,15 +820,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enable SPMD mode for TPU backend.
     "VLLM_XLA_USE_SPMD": lambda: bool(int(os.getenv("VLLM_XLA_USE_SPMD", "0"))),
-    "VLLM_FUSED_MOE_CHUNK_SIZE": lambda: int(
-        os.getenv("VLLM_FUSED_MOE_CHUNK_SIZE", str(16 * 1024))
-    ),
-    # Control whether to use fused MoE activation chunking. Current chunking
-    # logic is incompatible with torch.compile and causes IMA. See issue
-    # https://github.com/vllm-project/vllm/issues/19631.
-    "VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING": lambda: bool(
-        int(os.getenv("VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING", "1"))
-    ),
     # Controls whether to bypass the opaque MoE custom op wrapper.
     # - unset: automatically decide based on the MoE parallel config
     # - 0: always use the opaque custom op
