@@ -103,6 +103,8 @@ def _moe_forward_shared(
     layer_name: _layer_name_type,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    # TODO(bnell): this can be removed after MK migration is complete.
+    layer.ensure_moe_quant_config_init()
     return layer.runner.forward_impl(
         layer, hidden_states, router_logits, shared_experts_input
     )
