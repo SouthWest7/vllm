@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_FUSED_MOE_CHUNK_SIZE: int = 16 * 1024
     VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING: bool = True
+    VLLM_FUSED_MOE_USE_DIRECT_CALL: bool | None = None
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -829,6 +830,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # https://github.com/vllm-project/vllm/issues/19631.
     "VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING", "1"))
+    ),
+    # Controls whether to bypass the opaque MoE custom op wrapper.
+    # - unset: automatically decide based on the MoE parallel config
+    # - 0: always use the opaque custom op
+    # - 1: directly call the runner from the layer forward path
+    "VLLM_FUSED_MOE_USE_DIRECT_CALL": lambda: maybe_convert_bool(
+        os.environ.get("VLLM_FUSED_MOE_USE_DIRECT_CALL", None)
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

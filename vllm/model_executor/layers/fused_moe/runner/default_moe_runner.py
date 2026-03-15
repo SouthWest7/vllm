@@ -80,8 +80,6 @@ def _moe_forward(
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    # TODO(bnell): this can be removed after MK migration is complete.
-    layer.ensure_moe_quant_config_init()
     return layer.runner.forward_impl(
         layer, hidden_states, router_logits, shared_experts_input
     )
@@ -103,8 +101,6 @@ def _moe_forward_shared(
     layer_name: _layer_name_type,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    # TODO(bnell): this can be removed after MK migration is complete.
-    layer.ensure_moe_quant_config_init()
     return layer.runner.forward_impl(
         layer, hidden_states, router_logits, shared_experts_input
     )
@@ -210,10 +206,7 @@ class DefaultMoERunner(MoERunner):
         # Needed for string -> FusedMoE layer lookup in custom ops.
         self.layer_name = layer.layer_name
 
-        if current_platform.is_tpu() or current_platform.is_cpu():
-            # TODO: Once the OOM issue for the TPU backend is resolved, we
-            # will switch to using the moe_forward custom op.
-            # Note: CPU doesn't require wrapped forward_impl.
+        if self._should_use_direct_call():
             if self.shared_experts is None:
                 self.moe_forward = _moe_forward
             else:
@@ -227,6 +220,21 @@ class DefaultMoERunner(MoERunner):
         # Chunked all2all staging tensor
         self.batched_hidden_states: torch.Tensor | None = None
         self.batched_router_logits: torch.Tensor | None = None
+
+    def _should_use_direct_call(self) -> bool:
+        if current_platform.is_tpu() or current_platform.is_cpu():
+            # TODO: Once the OOM issue for the TPU backend is resolved, we
+            # will switch to using the moe_forward custom op.
+            # Note: CPU doesn't require wrapped forward_impl.
+            return True
+
+        if envs.VLLM_FUSED_MOE_USE_DIRECT_CALL is not None:
+            return envs.VLLM_FUSED_MOE_USE_DIRECT_CALL
+
+        return not (
+            self.moe_config.moe_parallel_config.use_ep
+            and self.moe_config.moe_parallel_config.dp_size > 1
+        )
 
     @property
     def use_dp_chunking(self) -> bool:
