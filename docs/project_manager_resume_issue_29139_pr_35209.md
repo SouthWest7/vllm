@@ -23,6 +23,7 @@ vLLM TP-MoE 通信优化项目（torch.compile Pass）
 - **验证与结果呈现**：组织 UT、`vllm serve`、`lm_eval`、e2e benchmark 的验证流程，确保 PR 描述包含可复现实验命令与结果。
 
 ## 量化产出（来自 PR #35209）
+> 注：以下统计为 2026-03-17 抓取 PR 页面时的数据快照，后续如有 rebase 或追加提交可能变化。
 - 代码变更规模：**12 个文件**，**20 次提交**，新增约 **994 行**。
 - 单测：`tests/compile/passes/distributed/test_sequence_parallelism_moe.py` 共 **20/20 通过**。
 - 端到端验证：完成服务侧压测与 `gsm8k` 任务评估，形成可复用的性能对比与回归基线。
