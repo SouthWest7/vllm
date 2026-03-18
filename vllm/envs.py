@@ -823,9 +823,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable SPMD mode for TPU backend.
     "VLLM_XLA_USE_SPMD": lambda: bool(int(os.getenv("VLLM_XLA_USE_SPMD", "0"))),
     # Controls whether to bypass the opaque MoE custom op wrapper.
-    # - unset: automatically decide based on the MoE parallel config
-    # - 0: always use the opaque custom op
-    # - 1: directly call the runner from the layer forward path
+    # This is only honored for non-DP-EP execution; DP+EP always uses
+    # the opaque custom op path.
+    # - unset: direct call for non-DP-EP, opaque custom op for DP+EP
+    # - 0: use the opaque custom op for non-DP-EP
+    # - 1: directly call the runner for non-DP-EP
     "VLLM_FUSED_MOE_USE_DIRECT_CALL": lambda: maybe_convert_bool(
         os.environ.get("VLLM_FUSED_MOE_USE_DIRECT_CALL", None)
     ),

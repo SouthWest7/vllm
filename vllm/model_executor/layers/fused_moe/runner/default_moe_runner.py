@@ -232,13 +232,17 @@ class DefaultMoERunner(MoERunner):
             # Note: CPU doesn't require wrapped forward_impl.
             return True
 
+        if (
+            self.moe_config.moe_parallel_config.use_ep
+            and self.moe_config.moe_parallel_config.dp_size > 1
+        ):
+            # DP+EP still requires the opaque custom op path.
+            return False
+
         if envs.VLLM_FUSED_MOE_USE_DIRECT_CALL is not None:
             return envs.VLLM_FUSED_MOE_USE_DIRECT_CALL
 
-        return not (
-            self.moe_config.moe_parallel_config.use_ep
-            and self.moe_config.moe_parallel_config.dp_size > 1
-        )
+        return True
 
     @property
     def use_dp_chunking(self) -> bool:
