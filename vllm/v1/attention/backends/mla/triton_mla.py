@@ -117,6 +117,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             self.supports_quant_query_input = False
 
         self._sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+        self._attn_logits_buffer: torch.Tensor | None = None
 
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
@@ -171,18 +172,24 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             max_splits = self._sm_count * occupancy_multiplier
             num_kv_splits = min(ideal_splits, max_splits)
 
-        # TODO(lucas) Allocate ahead of time
-        attn_logits = torch.empty(
-            (
-                B,
-                q_num_heads,
-                num_kv_splits,
-                # NOTE: the +1 stores the LogSumExp (LSE) that the stage2
-                # kernel uses to merge partial attention outputs across splits.
-                self.kv_lora_rank + 1,
-            ),
-            dtype=torch.float32,
-            device=q.device,
+        attn_logits_numel = B * q_num_heads * num_kv_splits * (self.kv_lora_rank + 1)
+        if (
+            self._attn_logits_buffer is None
+            or self._attn_logits_buffer.device != q.device
+            or self._attn_logits_buffer.numel() < attn_logits_numel
+        ):
+            self._attn_logits_buffer = torch.empty(
+                attn_logits_numel,
+                dtype=torch.float32,
+                device=q.device,
+            )
+        attn_logits = self._attn_logits_buffer[:attn_logits_numel].view(
+            B,
+            q_num_heads,
+            num_kv_splits,
+            # NOTE: the +1 stores the LogSumExp (LSE) that the stage2
+            # kernel uses to merge partial attention outputs across splits.
+            self.kv_lora_rank + 1,
         )
 
         # Add a head dim of 1
