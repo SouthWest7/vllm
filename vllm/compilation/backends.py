@@ -487,6 +487,9 @@ def _decompose_size_nodes(graph: fx.GraphModule) -> None:
     size_nodes = list(graph.graph.find_nodes(op="call_method", target="size"))
 
     for node in size_nodes:
+        # size(dim) already returns a single SymInt/int, not a torch.Size tuple.
+        if len(node.args) != 1:
+            continue
         tensor_node = node.args[0]
         ev = tensor_node.meta.get("example_value")
         assert ev is not None, (
@@ -513,6 +516,19 @@ def _decompose_size_nodes(graph: fx.GraphModule) -> None:
                         f"got {type(dim_val)} for dim {i} of "
                         f"'{node.name}'"
                     )
+
+        for user in list(node.users):
+            if user.op == "call_function" and user.target == operator.getitem:
+                index = user.args[1]
+                if isinstance(index, int):
+                    replacement: fx.Node | int | tuple[fx.Node | int, ...] = dims[index]
+                elif isinstance(index, slice):
+                    replacement = tuple(dims[index])
+                else:
+                    continue
+
+                user.replace_all_uses_with(replacement)  # type: ignore[arg-type]
+                graph.graph.erase_node(user)
 
         # Replace size node in each user's args.
         # Dynamo always passes size as a direct arg: view(clone, size)

@@ -1078,20 +1078,18 @@ def resolve_preloaded_moe_config(
     return get_default_config(M, E, N, w1_shape[2], top_k, dtype, block_shape)
 
 
-class PreloadedMoEConfigMixin:
-    """Helper for kernels that need compile-safe MoE config lookup."""
+class PreloadedMoEConfigResolver:
+    """Compile-safe resolver for runtime MoE kernel config lookup."""
 
-    moe_config: FusedMoEConfig
-    quant_config: FusedMoEQuantConfig
-    block_shape: list[int] | None
-    _preloaded_config_dtype: str | None
-    _preloaded_w1_shape: tuple[int, ...] | None
-    _preloaded_w2_shape: tuple[int, ...] | None
-    _preloaded_top_k: int | None
-    _preloaded_tuned_ms: tuple[int, ...] | None
-    _preloaded_tuned_configs: tuple[dict[str, int], ...] | None
-
-    def _init_preloaded_moe_config_state(self) -> None:
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        block_shape: list[int] | None,
+    ) -> None:
+        self._moe_config = moe_config
+        self._quant_config = quant_config
+        self._block_shape = block_shape
         self._preloaded_config_dtype: str | None = None
         self._preloaded_w1_shape: tuple[int, ...] | None = None
         self._preloaded_w2_shape: tuple[int, ...] | None = None
@@ -1099,18 +1097,18 @@ class PreloadedMoEConfigMixin:
         self._preloaded_tuned_ms: tuple[int, ...] | None = None
         self._preloaded_tuned_configs: tuple[dict[str, int], ...] | None = None
 
-    def preload_runtime_moe_config(
+    def preload(
         self,
         w1_shape: tuple[int, ...],
         w2_shape: tuple[int, ...],
         top_k: int,
     ) -> None:
-        config_dtype = self.quant_config.config_name(self.moe_config.in_dtype)
+        config_dtype = self._quant_config.config_name(self._moe_config.in_dtype)
         tuned_ms, tuned_configs = preload_moe_tuned_configs(
             w1_shape=w1_shape,
             w2_shape=w2_shape,
             dtype=config_dtype,
-            block_shape=self.block_shape,
+            block_shape=self._block_shape,
         )
         self._preloaded_config_dtype = config_dtype
         self._preloaded_w1_shape = tuple(w1_shape)
@@ -1119,7 +1117,7 @@ class PreloadedMoEConfigMixin:
         self._preloaded_tuned_ms = tuned_ms
         self._preloaded_tuned_configs = tuned_configs
 
-    def _resolve_runtime_moe_config(
+    def resolve(
         self,
         hidden_states_dtype: torch.dtype,
         M: int,
@@ -1127,7 +1125,7 @@ class PreloadedMoEConfigMixin:
         w2_shape: tuple[int, ...],
         top_k: int,
     ) -> dict[str, int]:
-        config_dtype = self.quant_config.config_name(hidden_states_dtype)
+        config_dtype = self._quant_config.config_name(hidden_states_dtype)
         if (
             config_dtype == self._preloaded_config_dtype
             and tuple(w1_shape) == self._preloaded_w1_shape
@@ -1140,7 +1138,7 @@ class PreloadedMoEConfigMixin:
                 w2_shape=w2_shape,
                 top_k=top_k,
                 dtype=config_dtype,
-                block_shape=self.block_shape,
+                block_shape=self._block_shape,
                 tuned_ms=self._preloaded_tuned_ms,
                 tuned_configs=self._preloaded_tuned_configs,
             )
@@ -1151,7 +1149,7 @@ class PreloadedMoEConfigMixin:
             top_k,
             config_dtype,
             M,
-            block_shape=self.block_shape,
+            block_shape=self._block_shape,
         )
 
 
@@ -2020,7 +2018,7 @@ def fused_experts_impl(
     return out_hidden_states
 
 
-class TritonExperts(PreloadedMoEConfigMixin, mk.FusedMoEExpertsModular):
+class TritonExperts(mk.FusedMoEExpertsModular):
     """Triton-based fused MoE expert implementation."""
 
     def __init__(
@@ -2029,7 +2027,19 @@ class TritonExperts(PreloadedMoEConfigMixin, mk.FusedMoEExpertsModular):
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config, quant_config)
-        self._init_preloaded_moe_config_state()
+        self._runtime_moe_config_resolver = PreloadedMoEConfigResolver(
+            moe_config=moe_config,
+            quant_config=quant_config,
+            block_shape=self.block_shape,
+        )
+
+    def preload_runtime_moe_config(
+        self,
+        w1_shape: tuple[int, ...],
+        w2_shape: tuple[int, ...],
+        top_k: int,
+    ) -> None:
+        self._runtime_moe_config_resolver.preload(w1_shape, w2_shape, top_k)
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -2169,7 +2179,7 @@ class TritonExperts(PreloadedMoEConfigMixin, mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = E
 
-        config = self._resolve_runtime_moe_config(
+        config = self._runtime_moe_config_resolver.resolve(
             hidden_states_dtype=hidden_states.dtype,
             M=num_tokens,
             w1_shape=tuple(w1.size()),

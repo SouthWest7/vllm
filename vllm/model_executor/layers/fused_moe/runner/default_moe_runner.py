@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -230,7 +230,48 @@ class DefaultMoERunner(MoERunner):
             self.quant_method.skip_forward_padding
         )
 
-        self.forward_mode = self._resolve_forward_mode(layer)
+        is_tpu_or_cpu = current_platform.is_tpu() or current_platform.is_cpu()
+        if is_tpu_or_cpu:
+            # TODO: Once the OOM issue for the TPU backend is resolved, we
+            # will switch to using the moe_forward custom op.
+            # Note: CPU doesn't require wrapped forward_impl.
+            supports_unwrapped_forward = True
+        else:
+            # The Transformers backend still routes through its own wrapper op
+            # and stores topk ids in the layer at runtime.
+            supports_unwrapped_forward = (
+                getattr(layer.__class__, "name", None) != "transformers_fused_moe"
+                and self.moe_config.dp_size == 1
+            )
+
+        if envs.VLLM_FUSED_MOE_WRAP_MODE == "wrapped":
+            self.forward_mode = "wrapped"
+        elif envs.VLLM_FUSED_MOE_WRAP_MODE == "unwrapped":
+            if not supports_unwrapped_forward:
+                raise ValueError(
+                    "VLLM_FUSED_MOE_WRAP_MODE=unwrapped is only supported for "
+                    "native non-DP FusedMoE/SharedFusedMoE paths."
+                )
+            self.forward_mode = "unwrapped"
+        else:
+            supports_auto_unwrapped_forward = supports_unwrapped_forward
+            if supports_auto_unwrapped_forward and not is_tpu_or_cpu:
+                layer_quant_method = getattr(layer, "quant_method", None)
+                is_unquantized_method = (
+                    layer_quant_method is not None
+                    and layer_quant_method.__class__.__name__
+                    == "UnquantizedFusedMoEMethod"
+                )
+                if is_unquantized_method:
+                    backend = getattr(layer_quant_method, "unquantized_backend", None)
+                    supports_auto_unwrapped_forward = (
+                        backend is not None
+                        and backend.name in {"TRITON", "BATCHED_TRITON"}
+                    )
+            self.forward_mode = (
+                "unwrapped" if supports_auto_unwrapped_forward else "wrapped"
+            )
+
         self.forward_entry, self.forward_impl = self._select_wrapped_forward()
         if self.forward_mode == "unwrapped":
             backend = getattr(self.quant_method, "unquantized_backend", None)
@@ -241,56 +282,6 @@ class DefaultMoERunner(MoERunner):
                 backend_name,
                 scope="local",
             )
-
-    def _supports_unwrapped_forward(self, layer: torch.nn.Module) -> bool:
-        if current_platform.is_tpu() or current_platform.is_cpu():
-            # TODO: Once the OOM issue for the TPU backend is resolved, we
-            # will switch to using the moe_forward custom op.
-            # Note: CPU doesn't require wrapped forward_impl.
-            return True
-
-        # The Transformers backend still routes through its own wrapper op and
-        # stores topk ids in the layer at runtime.
-        if getattr(layer.__class__, "name", None) == "transformers_fused_moe":
-            return False
-
-        return self.moe_config.dp_size == 1
-
-    def _supports_auto_unwrapped_forward(self, layer: torch.nn.Module) -> bool:
-        if not self._supports_unwrapped_forward(layer):
-            return False
-
-        if current_platform.is_tpu() or current_platform.is_cpu():
-            return True
-
-        quant_method = getattr(layer, "quant_method", None)
-        if quant_method is None:
-            return True
-
-        if quant_method.__class__.__name__ != "UnquantizedFusedMoEMethod":
-            return True
-
-        backend = getattr(quant_method, "unquantized_backend", None)
-        return backend is not None and backend.name in {"TRITON", "BATCHED_TRITON"}
-
-    def _resolve_forward_mode(
-        self, layer: torch.nn.Module
-    ) -> Literal["wrapped", "unwrapped"]:
-        configured_mode = envs.VLLM_FUSED_MOE_WRAP_MODE
-
-        if configured_mode == "wrapped":
-            return "wrapped"
-        if configured_mode == "unwrapped":
-            if not self._supports_unwrapped_forward(layer):
-                raise ValueError(
-                    "VLLM_FUSED_MOE_WRAP_MODE=unwrapped is only supported for "
-                    "native non-DP FusedMoE/SharedFusedMoE paths."
-                )
-            return "unwrapped"
-
-        return (
-            "unwrapped" if self._supports_auto_unwrapped_forward(layer) else "wrapped"
-        )
 
     def _select_wrapped_forward(self) -> tuple[Callable, Callable]:
         # Select implementation based on presence of DP chunking.

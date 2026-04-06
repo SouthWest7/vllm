@@ -353,8 +353,18 @@ class PiecewiseBackend:
         return None
 
     def __call__(self, *args: Any) -> Any:
-        runtime_shape = args[self.sym_shape_indices[0]]
-        range_entry = self._find_range_for_shape(runtime_shape)
+        runtime_shape: int | None = None
+        range_entry: RangeEntry | None
+        if not self.sym_shape_indices:
+            if len(self.range_entries) != 1:
+                raise RuntimeError(
+                    "PiecewiseBackend requires a symbolic shape input for "
+                    "multi-range dispatch."
+                )
+            range_entry = next(iter(self.range_entries.values()))
+        else:
+            runtime_shape = args[self.sym_shape_indices[0]]
+            range_entry = self._find_range_for_shape(runtime_shape)
 
         assert range_entry is not None, (
             f"Shape: {runtime_shape} out of considered ranges: {self.compile_ranges}"
