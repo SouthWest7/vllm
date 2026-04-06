@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import weakref
 from abc import abstractmethod
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -41,29 +40,11 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
-_LAYER_REGISTRY: dict[str, weakref.ReferenceType[torch.nn.Module]] = {}
-
-
-def register_layer_from_name(layer_name: str, layer: torch.nn.Module) -> None:
-    _LAYER_REGISTRY[layer_name] = weakref.ref(layer)
-
-
-def _get_registered_layer(layer_name: str) -> torch.nn.Module | None:
-    layer_ref = _LAYER_REGISTRY.get(layer_name)
-    if layer_ref is None:
-        return None
-
-    layer = layer_ref()
-    if layer is None:
-        _LAYER_REGISTRY.pop(layer_name, None)
-        return None
-
-    return layer
 
 
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
+    forward_context: ForwardContext = get_forward_context()
     if layer_name == "from_forward_context":
-        forward_context: ForwardContext = get_forward_context()
         all_moe_layers = forward_context.all_moe_layers
         assert all_moe_layers is not None
         moe_layer_index = forward_context.moe_layer_index
@@ -75,21 +56,7 @@ def get_layer_from_name(layer_name: str) -> torch.nn.Module:
             )
         layer_name = all_moe_layers[moe_layer_index]
         forward_context.moe_layer_index += 1
-
-    if is_forward_context_available():
-        forward_context = get_forward_context()
-        layer = forward_context.no_compile_layers.get(layer_name)
-        if layer is not None:
-            return layer
-
-    layer = _get_registered_layer(layer_name)
-    if layer is not None:
-        return layer
-
-    raise RuntimeError(
-        f"Unable to resolve MoE layer {layer_name!r} from the forward context "
-        "or the layer registry."
-    )
+    return forward_context.no_compile_layers[layer_name]
 
 
 # On torch >= 2.11, layer_name is a hoisted ModuleName opaque object;
@@ -245,12 +212,6 @@ class MoERunnerBase(MoERunner):
         # Needed for string -> FusedMoE layer lookup in custom ops.
         self.layer_name = layer_name
 
-        # Treat quant-method behavior toggles as runner invariants so the
-        # unwrapped forward path does not trace through Python properties.
-        self.quant_method_is_monolithic = bool(self.quant_method.is_monolithic)
-        self.quant_method_skip_forward_padding = bool(
-            self.quant_method.skip_forward_padding
-        )
         self.forward_mode = self._determine_forward_mode(is_transformers_fused_moe)
 
         self.forward_entry = self._select_forward()
@@ -324,10 +285,6 @@ class MoERunnerBase(MoERunner):
         if self._shared_experts is not None:
             self._shared_experts._quant_method = quant_method
         self.quant_method = quant_method
-        self.quant_method_is_monolithic = bool(self.quant_method.is_monolithic)
-        self.quant_method_skip_forward_padding = bool(
-            self.quant_method.skip_forward_padding
-        )
 
     def is_internal_router(self) -> bool:
         return self.gate is not None
@@ -442,7 +399,7 @@ class MoERunnerBase(MoERunner):
         )
         transformed_hidden_dim = hidden_states.shape[-1]
         if (
-            not self.quant_method_skip_forward_padding
+            not self.quant_method.skip_forward_padding
             and self.moe_config.hidden_dim != transformed_hidden_dim
         ):
             hidden_states = F.pad(
@@ -482,7 +439,7 @@ class MoERunnerBase(MoERunner):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
-        if self.quant_method_is_monolithic:
+        if self.quant_method.is_monolithic:
             fused_out = self.quant_method.apply_monolithic(
                 layer=layer,
                 x=hidden_states,
@@ -527,9 +484,6 @@ class MoERunnerBase(MoERunner):
             else nullcontext()
         )
 
-    def _resolve_layer(self) -> torch.nn.Module:
-        return get_layer_from_name(self.layer_name)
-
     def _forward_unwrapped(
         self,
         hidden_states: torch.Tensor,
@@ -539,7 +493,7 @@ class MoERunnerBase(MoERunner):
         assert self.moe_config.dp_size == 1
         assert not self.moe_config.moe_parallel_config.use_dp_chunking
         return self.forward_dispatch(
-            self._resolve_layer(),
+            get_layer_from_name(self.layer_name),
             hidden_states,
             router_logits,
             shared_experts_input,
