@@ -39,8 +39,11 @@ from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
 from vllm.model_executor.layers.fused_moe.router.router_factory import (
     create_fused_moe_router,
 )
-from vllm.model_executor.layers.fused_moe.runner.default_moe_runner import (
-    DefaultMoERunner,
+from vllm.model_executor.layers.fused_moe.runner.moe_runner_base import (
+    register_layer_from_name,
+)
+from vllm.model_executor.layers.fused_moe.runner.moe_runner_factory import (
+    create_moe_runner,
 )
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
@@ -569,11 +572,16 @@ class FusedMoE(CustomOp):
         # TODO(bnell): this is un-needed and removed in a follow up PR.
         self.base_quant_method = self.quant_method
 
+        register_layer_from_name(self.layer_name, self)
+
         # Storing the runner in the FusedMoE is an intermediate state, eventually
         # the runner will own the FusedMoE layer and provide the execution interface
         # for MoE ops.
-        self.runner = DefaultMoERunner(
-            layer=self,
+        self.runner = create_moe_runner(
+            layer_name=self.layer_name,
+            is_transformers_fused_moe=(
+                getattr(self.__class__, "name", None) == "transformers_fused_moe"
+            ),
             moe_config=self.moe_config,
             router=self.router,
             routed_input_transform=self._routed_input_transform,
@@ -1526,7 +1534,6 @@ class FusedMoE(CustomOp):
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.runner.forward(
-            self,
             hidden_states,
             router_logits,
         )
