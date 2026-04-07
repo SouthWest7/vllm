@@ -6143,57 +6143,6 @@ class GPUModelRunner(
             torch.accelerator.synchronize()
         self.maybe_remove_all_loras(self.lora_config)
 
-    def _collect_attention_backend_info(
-        self,
-        kv_cache_groups: list[KVCacheGroupSpec],
-    ) -> tuple[
-        list[dict[tuple[type[AttentionBackend], KVCacheSpec], list[str]]],
-        list[set[type[AttentionBackend]]],
-    ]:
-        attention_backend_maps = []
-        attention_backend_list = []
-        layer_type = cast(type[Any], AttentionLayerBase)
-
-        for kv_cache_group_spec in kv_cache_groups:
-            layers = get_layers_from_vllm_config(
-                self.vllm_config, layer_type, kv_cache_group_spec.layer_names
-            )
-            attn_backends: dict[
-                tuple[str, KVCacheSpec], tuple[type[AttentionBackend], KVCacheSpec]
-            ] = {}
-            attn_backend_layers: dict[tuple[str, KVCacheSpec], list[str]] = defaultdict(
-                list
-            )
-
-            # Dedupe based on full class name; this is a bit safer than using
-            # the class itself as the key because dynamic attention backend
-            # subclasses (for example ChunkedLocalAttention) may create
-            # distinct class objects for equivalent backends.
-            for layer_name in kv_cache_group_spec.layer_names:
-                attn_backend = layers[layer_name].get_attn_backend()
-
-                if layer_name in self.kv_sharing_fast_prefill_eligible_layers:
-                    attn_backend = create_fast_prefill_custom_backend(
-                        "FastPrefill",
-                        attn_backend,  # type: ignore[arg-type]
-                    )
-
-                layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
-                key = (attn_backend.full_cls_name(), layer_kv_cache_spec)
-                attn_backends[key] = (attn_backend, layer_kv_cache_spec)
-                attn_backend_layers[key].append(layer_name)
-
-            attention_backend_maps.append(
-                {attn_backends[k]: v for k, v in attn_backend_layers.items()}
-            )
-            attention_backend_list.append(
-                {group_key[0] for group_key in attn_backends.values()}
-            )
-
-        return attention_backend_maps, attention_backend_list
-
     def initialize_attn_backend(
         self,
         kv_cache_config: KVCacheConfig,
@@ -6204,10 +6153,49 @@ class GPUModelRunner(
         """
         assert len(self.attn_groups) == 0, "Attention backends are already initialized"
 
+        class AttentionGroupKey(NamedTuple):
+            attn_backend: type[AttentionBackend]
+            kv_cache_spec: KVCacheSpec
+
+        def get_attn_backends_for_group(
+            kv_cache_group_spec: KVCacheGroupSpec,
+        ) -> tuple[dict[AttentionGroupKey, list[str]], set[type[AttentionBackend]]]:
+            layer_type = cast(type[Any], AttentionLayerBase)
+            layers = get_layers_from_vllm_config(
+                self.vllm_config, layer_type, kv_cache_group_spec.layer_names
+            )
+            attn_backends = {}
+            attn_backend_layers = defaultdict(list)
+            # Dedupe based on full class name; this is a bit safer than
+            # using the class itself as the key because when we create dynamic
+            # attention backend subclasses (e.g. ChunkedLocalAttention) unless
+            # they are cached correctly, there will be different objects per
+            # layer.
+            for layer_name in kv_cache_group_spec.layer_names:
+                attn_backend = layers[layer_name].get_attn_backend()
+
+                if layer_name in self.kv_sharing_fast_prefill_eligible_layers:
+                    attn_backend = create_fast_prefill_custom_backend(
+                        "FastPrefill",
+                        attn_backend,  # type: ignore[arg-type]
+                    )
+
+                full_cls_name = attn_backend.full_cls_name()
+                layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
+                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                key = (full_cls_name, layer_kv_cache_spec)
+                attn_backends[key] = AttentionGroupKey(
+                    attn_backend, layer_kv_cache_spec
+                )
+                attn_backend_layers[key].append(layer_name)
+            return (
+                {attn_backends[k]: v for k, v in attn_backend_layers.items()},
+                set(group_key.attn_backend for group_key in attn_backends.values()),
+            )
+
         def create_attn_groups(
-            attn_backends_map: dict[
-                tuple[type[AttentionBackend], KVCacheSpec], list[str]
-            ],
+            attn_backends_map: dict[AttentionGroupKey, list[str]],
             kv_cache_group_id: int,
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
@@ -6222,10 +6210,12 @@ class GPUModelRunner(
                 attn_groups.append(attn_group)
             return attn_groups
 
-        (
-            attention_backend_maps,
-            attention_backend_list,
-        ) = self._collect_attention_backend_info(kv_cache_config.kv_cache_groups)
+        attention_backend_maps = []
+        attention_backend_list = []
+        for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
+            attn_backends = get_attn_backends_for_group(kv_cache_group_spec)
+            attention_backend_maps.append(attn_backends[0])
+            attention_backend_list.append(attn_backends[1])
 
         # Resolve cudagraph_mode before actually initialize metadata_builders
         self._check_and_update_cudagraph_mode(
