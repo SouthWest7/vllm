@@ -334,8 +334,7 @@ def async_tp_pass_on_test_model(
     init_distributed_environment()
 
     # configure vllm config for SequenceParallelismPass
-    vllm_config = VllmConfig()
-    vllm_config.compilation_config = CompilationConfig(
+    compilation_config = CompilationConfig(
         splitting_ops=splitting_ops,
         use_inductor_graph_partition=use_inductor_graph_partition,
         pass_config=PassConfig(
@@ -343,20 +342,20 @@ def async_tp_pass_on_test_model(
             sp_min_token_num=1,
         ),
     )
-    vllm_config.device_config = DeviceConfig(device=torch.device("cuda"))
-    vllm_config.parallel_config = ParallelConfig(tensor_parallel_size=world_size)
+    device_config = DeviceConfig(device=torch.device("cuda"))
+    parallel_config = ParallelConfig(tensor_parallel_size=world_size)
 
     # this is a fake model name to construct the model config
     # in the vllm_config, it's not really used.
     model_name = "RedHatAI/Llama-3.2-1B-Instruct-FP8"
-    vllm_config.model_config = ModelConfig(
+    model_config = ModelConfig(
         model=model_name, trust_remote_code=True, dtype=dtype, seed=42
     )
     vllm_config = VllmConfig(
-        model_config=vllm_config.model_config,
-        device_config=vllm_config.device_config,
-        parallel_config=vllm_config.parallel_config,
-        compilation_config=vllm_config.compilation_config,
+        model_config=model_config,
+        device_config=device_config,
+        parallel_config=parallel_config,
+        compilation_config=compilation_config,
     )
 
     with set_current_vllm_config(vllm_config):

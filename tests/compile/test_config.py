@@ -463,7 +463,7 @@ def test_sequence_parallelism_depends_on_compilation_topology(
     use_inductor_graph_partition: bool,
     expect_sp_enabled: bool,
 ):
-    with patch("vllm.config.parallel.cuda_device_count_stateless", return_value=2):
+    with patch.object(current_platform, "device_count", return_value=2):
         compilation_config = CompilationConfig(
             cudagraph_capture_sizes=[1, 2, 4, 15],
             use_inductor_graph_partition=use_inductor_graph_partition,
@@ -475,16 +475,35 @@ def test_sequence_parallelism_depends_on_compilation_topology(
                 eliminate_noops=True,
                 sp_min_token_num=512,
             ),
-            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            cudagraph_mode=cudagraph_mode,
         )
-        engine_args = EngineArgs(
-            model="facebook/opt-125m",
-            tensor_parallel_size=2,
-            max_num_seqs=128,
-            max_num_batched_tokens=2048,
+        vllm_config = VllmConfig(
             compilation_config=compilation_config,
+            parallel_config=ParallelConfig(tensor_parallel_size=2),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=128,
+                max_num_batched_tokens=2048,
+                max_model_len=2048,
+                is_encoder_decoder=False,
+            ),
         )
-        vllm_config = engine_args.create_engine_config()
+        vllm_config.model_config = MagicMock(
+            dtype=torch.float16,
+            enforce_eager=False,
+            is_moe=False,
+            disable_cascade_attn=False,
+            get_hidden_size=MagicMock(return_value=4096),
+        )
+        vllm_config.compilation_config.max_cudagraph_capture_size = None
+        vllm_config.compilation_config.cudagraph_capture_sizes = [1, 2, 4, 15]
+        vllm_config.compilation_config.compile_sizes = ["cudagraph_capture_sizes"]
+        vllm_config.compilation_config.set_splitting_ops_for_v1(
+            all2all_backend=vllm_config.parallel_config.all2all_backend,
+            data_parallel_size=1,
+        )
+        vllm_config._finalize_sequence_parallelism_config()
+        vllm_config._set_compile_ranges()
+        vllm_config._set_cudagraph_sizes()
 
     assert (
         vllm_config.compilation_config.use_inductor_graph_partition
