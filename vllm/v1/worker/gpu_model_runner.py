@@ -5726,11 +5726,6 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
-        # Resolve any backend-driven cudagraph downgrade before the first dummy
-        # compile. Otherwise profile_run() can compile SP graphs that become
-        # stale once attention backend probing later forces PIECEWISE mode.
-        self._prepare_cudagraph_mode_for_profile_run()
-
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
@@ -6198,35 +6193,6 @@ class GPUModelRunner(
             )
 
         return attention_backend_maps, attention_backend_list
-
-    def _prepare_cudagraph_mode_for_profile_run(self) -> None:
-        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
-
-        kv_cache_spec = self.get_kv_cache_spec()
-        kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
-        temp_kv_cache_config = KVCacheConfig(
-            num_blocks=0,
-            kv_cache_tensors=[],
-            kv_cache_groups=kv_cache_groups,
-        )
-        old_kv_cache_config = getattr(self, "kv_cache_config", None)
-        self.kv_cache_config = temp_kv_cache_config
-        try:
-            self.may_add_encoder_only_layers_to_kv_cache_config()
-            self.maybe_add_kv_sharing_layers_to_kv_cache_groups(temp_kv_cache_config)
-        finally:
-            if old_kv_cache_config is None:
-                del self.kv_cache_config
-            else:
-                self.kv_cache_config = old_kv_cache_config
-        _, attention_backends = self._collect_attention_backend_info(
-            temp_kv_cache_config.kv_cache_groups
-        )
-        self._check_and_update_cudagraph_mode(
-            attention_backends,
-            temp_kv_cache_config.kv_cache_groups,
-            is_profiling=True,
-        )
 
     def initialize_attn_backend(
         self,

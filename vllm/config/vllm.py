@@ -1290,12 +1290,6 @@ class VllmConfig:
             if size % self.parallel_config.tensor_parallel_size == 0
         ]
 
-    def _uses_full_graph_compilation(self) -> bool:
-        return (
-            self.compilation_config.use_inductor_graph_partition
-            or len(self.compilation_config.splitting_ops or []) == 0
-        )
-
     def _finalize_sequence_parallelism_config(self) -> None:
         # async tp is built on top of sequence parallelism and requires it.
         pass_config = self.compilation_config.pass_config
@@ -1328,18 +1322,6 @@ class VllmConfig:
                 "Model hidden_size too small for the SP "
                 "threshold heuristic, disabling. To force SP, "
                 "set pass_config.sp_min_token_num manually."
-            )
-            pass_config.enable_sp = False
-            pass_config.fuse_gemm_comms = False
-            return
-
-        if (
-            self.compilation_config.mode == CompilationMode.VLLM_COMPILE
-            and not self._uses_full_graph_compilation()
-        ):
-            logger.warning_once(
-                "Sequence parallelism requires full-graph compilation; "
-                "disabling it for piecewise compilation."
             )
             pass_config.enable_sp = False
             pass_config.fuse_gemm_comms = False

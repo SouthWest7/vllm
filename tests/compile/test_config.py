@@ -450,18 +450,17 @@ def test_cudagraph_sizes_post_init(
     reason="Skip if not cudagraph mode supported",
 )
 @pytest.mark.parametrize(
-    ("cudagraph_mode", "use_inductor_graph_partition", "expect_sp_enabled"),
+    ("cudagraph_mode", "use_inductor_graph_partition"),
     [
-        (CUDAGraphMode.PIECEWISE, False, False),
-        (CUDAGraphMode.FULL_DECODE_ONLY, False, False),
-        (CUDAGraphMode.FULL_AND_PIECEWISE, False, False),
-        (CUDAGraphMode.FULL_AND_PIECEWISE, True, True),
+        (CUDAGraphMode.PIECEWISE, False),
+        (CUDAGraphMode.FULL_DECODE_ONLY, False),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, False),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, True),
     ],
 )
-def test_sequence_parallelism_depends_on_compilation_topology(
+def test_sequence_parallelism_is_independent_of_cudagraph_topology(
     cudagraph_mode: CUDAGraphMode,
     use_inductor_graph_partition: bool,
-    expect_sp_enabled: bool,
 ):
     with patch.object(current_platform, "device_count", return_value=2):
         compilation_config = CompilationConfig(
@@ -510,18 +509,11 @@ def test_sequence_parallelism_depends_on_compilation_topology(
         == use_inductor_graph_partition
     )
     assert bool(vllm_config.compilation_config.splitting_ops)
-    assert vllm_config.compilation_config.pass_config.enable_sp == expect_sp_enabled
-    assert (
-        vllm_config.compilation_config.pass_config.fuse_gemm_comms == expect_sp_enabled
-    )
-    if expect_sp_enabled:
-        assert vllm_config.compilation_config.cudagraph_capture_sizes == [2, 4]
-        assert vllm_config.compilation_config.max_cudagraph_capture_size == 4
-        assert 511 in vllm_config.compilation_config.compile_ranges_endpoints
-    else:
-        assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4, 15]
-        assert vllm_config.compilation_config.max_cudagraph_capture_size == 15
-        assert 511 not in vllm_config.compilation_config.compile_ranges_endpoints
+    assert vllm_config.compilation_config.pass_config.enable_sp
+    assert vllm_config.compilation_config.pass_config.fuse_gemm_comms
+    assert vllm_config.compilation_config.cudagraph_capture_sizes == [2, 4]
+    assert vllm_config.compilation_config.max_cudagraph_capture_size == 4
+    assert 511 in vllm_config.compilation_config.compile_ranges_endpoints
 
 
 def test_cached_compilation_config(default_vllm_config):

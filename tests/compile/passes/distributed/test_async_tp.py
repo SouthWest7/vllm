@@ -14,7 +14,6 @@ from vllm.config import (
     CompilationConfig,
     DeviceConfig,
     ModelConfig,
-    ParallelConfig,
     PassConfig,
     VllmConfig,
     set_current_vllm_config,
@@ -241,13 +240,6 @@ class TestAGCutlassScaledMMModel(_BaseScaledMMModel):
 @pytest.mark.parametrize("hidden_size", [16])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dynamic", [True, False])
-@pytest.mark.parametrize(
-    ("splitting_ops", "use_inductor_graph_partition", "expect_async_tp_enabled"),
-    [
-        ([], False, True),
-        (["dummy_split"], False, False),
-    ],
-)
 @pytest.mark.skipif(envs.VLLM_TARGET_DEVICE not in ["cuda"], reason="Only test on CUDA")
 def test_async_tp_pass_replace(
     test_model: str,
@@ -256,9 +248,6 @@ def test_async_tp_pass_replace(
     hidden_size: int,
     dtype: torch.dtype,
     dynamic: bool,
-    splitting_ops: list[str],
-    use_inductor_graph_partition: bool,
-    expect_async_tp_enabled: bool,
 ):
     if (
         test_model
@@ -290,9 +279,6 @@ def test_async_tp_pass_replace(
                 hidden_size,
                 dtype,
                 dynamic,
-                splitting_ops,
-                use_inductor_graph_partition,
-                expect_async_tp_enabled,
             ),
             nprocs=nprocs,
         )
@@ -309,9 +295,6 @@ def async_tp_pass_on_test_model(
     hidden_size: int,
     dtype: torch.dtype,
     dynamic: bool,
-    splitting_ops: list[str],
-    use_inductor_graph_partition: bool,
-    expect_async_tp_enabled: bool,
 ):
     set_random_seed(0)
 
@@ -335,15 +318,11 @@ def async_tp_pass_on_test_model(
 
     # configure vllm config for SequenceParallelismPass
     compilation_config = CompilationConfig(
-        splitting_ops=splitting_ops,
-        use_inductor_graph_partition=use_inductor_graph_partition,
         pass_config=PassConfig(
             fuse_gemm_comms=True,
-            sp_min_token_num=1,
         ),
     )
     device_config = DeviceConfig(device=torch.device("cuda"))
-    parallel_config = ParallelConfig(tensor_parallel_size=world_size)
 
     # this is a fake model name to construct the model config
     # in the vllm_config, it's not really used.
@@ -354,19 +333,11 @@ def async_tp_pass_on_test_model(
     vllm_config = VllmConfig(
         model_config=model_config,
         device_config=device_config,
-        parallel_config=parallel_config,
         compilation_config=compilation_config,
     )
 
     with set_current_vllm_config(vllm_config):
         initialize_model_parallel(tensor_model_parallel_size=world_size)
-        assert (
-            vllm_config.compilation_config.pass_config.fuse_gemm_comms
-            == expect_async_tp_enabled
-        )
-        if not expect_async_tp_enabled:
-            return
-
         async_tp_pass = AsyncTPPass(vllm_config)
         backend = TestBackend(async_tp_pass)
 
