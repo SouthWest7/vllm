@@ -68,6 +68,7 @@ class SharedExperts:
         self._layer = layer
         self._moe_config = moe_config
         self._quant_method = quant_method
+        self._mk_owns_shared_expert = quant_method.mk_owns_shared_expert
         self._reduce_results = reduce_results
         self._use_dp_chunking = moe_config.moe_parallel_config.use_dp_chunking
 
@@ -86,6 +87,7 @@ class SharedExperts:
                 logger.debug_once(
                     "Enabled separate cuda stream for MoE shared_experts", scope="local"
                 )
+        self._has_aux_stream = self._stream is not None
 
     @property
     def _use_external_experts(self) -> bool:
@@ -105,13 +107,13 @@ class SharedExperts:
         self,
         hidden_states: torch.Tensor,
     ) -> SharedExpertsOrder:
-        if self._quant_method.mk_owns_shared_expert:
+        if self._mk_owns_shared_expert:
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda()
             and not self._use_dp_chunking
-            and self._stream is not None
+            and self._has_aux_stream
             and hidden_states.shape[0]
             <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
         )

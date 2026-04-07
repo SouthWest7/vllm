@@ -191,6 +191,8 @@ class MoERunnerBase(MoERunner):
         self.routed_input_transform = routed_input_transform
         self.gate = gate
         self.quant_method = quant_method
+        self.quant_method_is_monolithic = quant_method.is_monolithic
+        self.quant_method_skip_forward_padding = quant_method.skip_forward_padding
         self._reduce_results = reduce_results
         self.enable_dbo = enable_dbo
 
@@ -399,7 +401,7 @@ class MoERunnerBase(MoERunner):
         )
         transformed_hidden_dim = hidden_states.shape[-1]
         if (
-            not self.quant_method.skip_forward_padding
+            not self.quant_method_skip_forward_padding
             and self.moe_config.hidden_dim != transformed_hidden_dim
         ):
             hidden_states = F.pad(
@@ -439,7 +441,7 @@ class MoERunnerBase(MoERunner):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
-        if self.quant_method.is_monolithic:
+        if self.quant_method_is_monolithic:
             fused_out = self.quant_method.apply_monolithic(
                 layer=layer,
                 x=hidden_states,
