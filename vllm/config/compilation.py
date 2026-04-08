@@ -281,9 +281,9 @@ class PassConfig:
         TODO also log the compile ranges for which this is enabled.
         """
         enabled_fusions = [
-            name[len("fuse_") :]
-            for name, value in vars(self).items()
-            if value and name.startswith("fuse_")
+            f.name[len("fuse_") :]
+            for f in fields(self)  # type: ignore[arg-type]
+            if getattr(self, f.name) and f.name.startswith("fuse_")
         ]
 
         if enabled_fusions:
@@ -711,9 +711,7 @@ class CompilationConfig:
     # Attention ops; used for piecewise cudagraphs
     # Use PyTorch operator format: "namespace::name"
     _attention_ops: ClassVar[list[str]] = [
-        "vllm::unified_attention",
         "vllm::unified_attention_with_output",
-        "vllm::unified_mla_attention",
         "vllm::unified_mla_attention_with_output",
         "vllm::mamba_mixer2",
         "vllm::mamba_mixer",
