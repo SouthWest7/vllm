@@ -1423,10 +1423,9 @@ class VllmConfig:
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
             # determine the initial max_cudagraph_capture_size
-            user_max_cudagraph_capture_size = (
+            max_cudagraph_capture_size = (
                 self.compilation_config.max_cudagraph_capture_size
             )
-            max_cudagraph_capture_size = user_max_cudagraph_capture_size
             if max_cudagraph_capture_size is None:
                 decode_query_len = 1
                 if (
@@ -1440,23 +1439,19 @@ class VllmConfig:
             max_num_tokens = self.scheduler_config.max_num_batched_tokens
             max_cudagraph_capture_size = min(max_num_tokens, max_cudagraph_capture_size)
 
-            assert max_cudagraph_capture_size is not None
             assert max_cudagraph_capture_size >= 1, (
                 "Maximum cudagraph size should be greater than or equal to 1 "
                 "when using cuda graph."
             )
 
             # determine the cudagraph_capture_sizes
-            user_cudagraph_capture_sizes = (
-                self.compilation_config.cudagraph_capture_sizes
-            )
-            if user_cudagraph_capture_sizes is not None:
-                assert len(user_cudagraph_capture_sizes) > 0, (
+            if self.compilation_config.cudagraph_capture_sizes is not None:
+                assert len(self.compilation_config.cudagraph_capture_sizes) > 0, (
                     "cudagraph_capture_sizes should contain at least one element "
                     "when using cuda graph."
                 )
                 # de-duplicate the sizes provided by the config
-                dedup_sizes = list(set(user_cudagraph_capture_sizes))
+                dedup_sizes = list(set(self.compilation_config.cudagraph_capture_sizes))
                 cudagraph_capture_sizes = [
                     i for i in dedup_sizes if i <= max_num_tokens
                 ]
@@ -1499,15 +1494,15 @@ class VllmConfig:
                 cudagraph_capture_sizes[-1] if cudagraph_capture_sizes else 0
             )
             if (
-                user_max_cudagraph_capture_size is not None
-                and user_max_cudagraph_capture_size != valid_max_size
+                self.compilation_config.max_cudagraph_capture_size is not None
+                and self.compilation_config.max_cudagraph_capture_size != valid_max_size
             ):
                 # raise error only when both two flags are user-specified
                 # and they are inconsistent with each other
-                if user_cudagraph_capture_sizes is not None:
+                if self.compilation_config.cudagraph_capture_sizes is not None:
                     raise ValueError(
                         "customized max_cudagraph_capture_size"
-                        f"(={user_max_cudagraph_capture_size}) "
+                        f"(={self.compilation_config.max_cudagraph_capture_size}) "
                         "should be consistent with the max value of "
                         f"cudagraph_capture_sizes(={valid_max_size})"
                     )
@@ -1519,9 +1514,9 @@ class VllmConfig:
             # always set the final max_cudagraph_capture_size
             self.compilation_config.max_cudagraph_capture_size = valid_max_size
 
-            if user_cudagraph_capture_sizes is not None and len(
+            if self.compilation_config.cudagraph_capture_sizes is not None and len(
                 cudagraph_capture_sizes
-            ) < len(user_cudagraph_capture_sizes):
+            ) < len(self.compilation_config.cudagraph_capture_sizes):
                 # If users have specified capture sizes, we only need to
                 # compare the lens before and after modification since the modified
                 # list is only the subset of the original list.
@@ -1530,7 +1525,7 @@ class VllmConfig:
                         "cudagraph_capture_sizes specified in compilation_config"
                         " %s is overridden by config %s"
                     ),
-                    user_cudagraph_capture_sizes,
+                    self.compilation_config.cudagraph_capture_sizes,
                     cudagraph_capture_sizes,
                 )
             # always write back the final sizes
@@ -1619,9 +1614,8 @@ class VllmConfig:
                         compile_range_end,
                     )
 
-        user_compile_ranges_endpoints = compilation_config.compile_ranges_endpoints
-        if user_compile_ranges_endpoints is not None:
-            for x in user_compile_ranges_endpoints:
+        if compilation_config.compile_ranges_endpoints is not None:
+            for x in compilation_config.compile_ranges_endpoints:
                 assert isinstance(x, int)
                 assert x > 0, f"Invalid compile range endpoint: {x}"
                 if compile_range_end is not None and x < compile_range_end and x > 1:

@@ -1025,8 +1025,8 @@ class CompilationConfig:
         computed_compile_sizes: list[int] = []
         if self.compile_sizes is not None:
             # de-duplicate the sizes provided by the config
-            dedup_compile_sizes = list(set(self.compile_sizes))
-            for x in dedup_compile_sizes:
+            self.compile_sizes = list(set(self.compile_sizes))
+            for x in self.compile_sizes:
                 if isinstance(x, str):
                     assert x == "cudagraph_capture_sizes", (
                         "Unrecognized size type in compile_sizes, "
