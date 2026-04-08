@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
 import pytest
 import torch
 
@@ -317,27 +318,24 @@ def async_tp_pass_on_test_model(
     init_distributed_environment()
 
     # configure vllm config for SequenceParallelismPass
-    compilation_config = CompilationConfig(
+    vllm_config = VllmConfig()
+    vllm_config.compilation_config = CompilationConfig(
         pass_config=PassConfig(
             fuse_gemm_comms=True,
         ),
     )
-    device_config = DeviceConfig(device=torch.device("cuda"))
+    vllm_config.device_config = DeviceConfig(device=torch.device("cuda"))
 
     # this is a fake model name to construct the model config
     # in the vllm_config, it's not really used.
     model_name = "RedHatAI/Llama-3.2-1B-Instruct-FP8"
-    model_config = ModelConfig(
+    vllm_config.model_config = ModelConfig(
         model=model_name, trust_remote_code=True, dtype=dtype, seed=42
-    )
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        device_config=device_config,
-        compilation_config=compilation_config,
     )
 
     with set_current_vllm_config(vllm_config):
         initialize_model_parallel(tensor_model_parallel_size=world_size)
+
         async_tp_pass = AsyncTPPass(vllm_config)
         backend = TestBackend(async_tp_pass)
 
