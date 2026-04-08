@@ -1304,6 +1304,23 @@ class VllmConfig:
             pass_config.fuse_gemm_comms = False
             return
 
+        # SP is only supported when compiling the whole graph (fullgraph).
+        # Piecewise compilation is not supported because the residual tensor
+        # gets split across TP ranks, causing size mismatches at subgraph
+        # boundaries.
+        if (
+            not self.compilation_config.use_inductor_graph_partition
+            and self.compilation_config.splitting_ops
+        ):
+            logger.warning(
+                "Sequence parallelism is only supported when compiling the "
+                "whole graph. Disabling SP and async TP because this "
+                "configuration uses piecewise compilation."
+            )
+            pass_config.enable_sp = False
+            pass_config.fuse_gemm_comms = False
+            return
+
         if pass_config.sp_min_token_num is None:
             from vllm.compilation.passes.fusion.sequence_parallelism import (
                 get_sequence_parallelism_threshold,

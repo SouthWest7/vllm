@@ -387,8 +387,8 @@ def test_should_split():
         (None, 257, 1, False, 2048, CUDAGraphMode.FULL_AND_PIECEWISE, 256),
         # max from list
         ([1, 2, 4, 15], None, 1, False, 2048, CUDAGraphMode.FULL_AND_PIECEWISE, 15),
-        # filtered out 15 due to SP
-        ([1, 2, 4, 15], None, 2, True, 2048, CUDAGraphMode.FULL_AND_PIECEWISE, 4),
+        # SP disabled for piecewise compilation, sizes not filtered
+        ([1, 2, 4, 15], None, 2, True, 2048, CUDAGraphMode.FULL_AND_PIECEWISE, 15),
         # limited by the max_tokens
         ([1, 2, 4, 15], None, 1, False, 8, CUDAGraphMode.FULL_AND_PIECEWISE, 4),
         # the list should contain at least 1 element when use cudagraph
@@ -450,17 +450,26 @@ def test_cudagraph_sizes_post_init(
     reason="Skip if not cudagraph mode supported",
 )
 @pytest.mark.parametrize(
-    ("cudagraph_mode", "use_inductor_graph_partition"),
+    (
+        "cudagraph_mode",
+        "use_inductor_graph_partition",
+        "expected_enable_sp",
+        "expected_capture_sizes",
+        "expected_max_size",
+    ),
     [
-        (CUDAGraphMode.PIECEWISE, False),
-        (CUDAGraphMode.FULL_DECODE_ONLY, False),
-        (CUDAGraphMode.FULL_AND_PIECEWISE, False),
-        (CUDAGraphMode.FULL_AND_PIECEWISE, True),
+        (CUDAGraphMode.PIECEWISE, False, False, [1, 2, 4, 15], 15),
+        (CUDAGraphMode.FULL_DECODE_ONLY, False, False, [1, 2, 4, 15], 15),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, False, False, [1, 2, 4, 15], 15),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, True, True, [2, 4], 4),
     ],
 )
-def test_sequence_parallelism_is_independent_of_cudagraph_topology(
+def test_sequence_parallelism_requires_whole_graph_compilation(
     cudagraph_mode: CUDAGraphMode,
     use_inductor_graph_partition: bool,
+    expected_enable_sp: bool,
+    expected_capture_sizes: list[int],
+    expected_max_size: int,
 ):
     with patch.object(current_platform, "device_count", return_value=2):
         compilation_config = CompilationConfig(
@@ -509,11 +518,23 @@ def test_sequence_parallelism_is_independent_of_cudagraph_topology(
         == use_inductor_graph_partition
     )
     assert bool(vllm_config.compilation_config.splitting_ops)
-    assert vllm_config.compilation_config.pass_config.enable_sp
-    assert vllm_config.compilation_config.pass_config.fuse_gemm_comms
-    assert vllm_config.compilation_config.cudagraph_capture_sizes == [2, 4]
-    assert vllm_config.compilation_config.max_cudagraph_capture_size == 4
-    assert 511 in vllm_config.compilation_config.compile_ranges_endpoints
+    assert (
+        bool(vllm_config.compilation_config.splitting_ops)
+        and not vllm_config.compilation_config.use_inductor_graph_partition
+    ) == (not expected_enable_sp)
+    assert vllm_config.compilation_config.pass_config.enable_sp == expected_enable_sp
+    assert (
+        vllm_config.compilation_config.pass_config.fuse_gemm_comms == expected_enable_sp
+    )
+    assert (
+        vllm_config.compilation_config.cudagraph_capture_sizes == expected_capture_sizes
+    )
+    assert (
+        vllm_config.compilation_config.max_cudagraph_capture_size == expected_max_size
+    )
+    assert (
+        511 in vllm_config.compilation_config.compile_ranges_endpoints
+    ) == expected_enable_sp
 
 
 def test_cached_compilation_config(default_vllm_config):
