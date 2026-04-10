@@ -54,22 +54,9 @@ def is_uva_available() -> bool:
     return is_pin_memory_available()
 
 
-_NUM_COMPUTE_UNITS_CACHE: dict[int, int] = {}
-
-
+@cache
 def num_compute_units(device_id: int = 0) -> int:
-    """Get the number of compute units of the current device.
-
-    Avoid functools cache wrappers here because Dynamo warns when it traces
-    calls through lru_cache/cache-wrapped helpers.
-    """
+    """Get the number of compute units of the current device."""
     from vllm.platforms import current_platform
 
-    if torch.compiler.is_dynamo_compiling():
-        return current_platform.num_compute_units(device_id)
-
-    if device_id not in _NUM_COMPUTE_UNITS_CACHE:
-        _NUM_COMPUTE_UNITS_CACHE[device_id] = current_platform.num_compute_units(
-            device_id
-        )
-    return _NUM_COMPUTE_UNITS_CACHE[device_id]
+    return current_platform.num_compute_units(device_id)

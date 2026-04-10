@@ -255,7 +255,7 @@ class CustomOp(nn.Module):
                         dims_list = [dims] if isinstance(dims, int) else dims
                         for d in dims_list:
                             real_d = arg.ndim + d if d < 0 else d
-                            torch._dynamo.maybe_mark_dynamic(arg, real_d)
+                            torch._dynamo.mark_dynamic(arg, real_d)
                 return compiled_fn(*args, **kwargs)
 
             return wrapper

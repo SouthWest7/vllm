@@ -419,7 +419,7 @@ def _support_torch_compile(
                 else:
                     torch._dynamo.decorators.mark_unbacked(arg, dims)
             else:
-                torch._dynamo.maybe_mark_dynamic(arg, dims)
+                torch._dynamo.mark_dynamic(arg, dims)
 
         sig = inspect.signature(mod.__class__.forward)  # type: ignore[attr-defined]
         bound_args = sig.bind(mod, *args, **kwargs)

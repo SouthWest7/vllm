@@ -2516,16 +2516,13 @@ if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "marlin_gemm_moe")
         top_k: int,
         mul_topk_weights: bool,
         b_q_type: ScalarType,
-        size_m: torch.SymInt,
-        size_n: torch.SymInt,
-        size_k: torch.SymInt,
+        size_m: int,
+        size_n: int,
+        size_k: int,
         is_k_full: bool,
         use_atomic_add: bool,
         use_fp32_reduce: bool,
         is_zp_float: bool,
-        thread_k: int = -1,
-        thread_n: int = -1,
-        blocks_per_sm: int = -1,
     ):
         return torch.empty(
             (size_m * top_k, size_n), dtype=input.dtype, device=input.device

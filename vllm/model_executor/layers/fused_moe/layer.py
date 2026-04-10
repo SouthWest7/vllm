@@ -574,9 +574,6 @@ class FusedMoE(CustomOp):
         # for MoE ops.
         self.runner = create_moe_runner(
             layer_name=self.layer_name,
-            is_transformers_fused_moe=(
-                getattr(self.__class__, "name", None) == "transformers_fused_moe"
-            ),
             moe_config=self.moe_config,
             router=self.router,
             routed_input_transform=self._routed_input_transform,
@@ -1178,7 +1175,7 @@ class FusedMoE(CustomOp):
             if shard_id in {"w1", "w3"}:
                 final_shape[1] *= 2
             final_shape[shard_dim] = final_shape[shard_dim] // self.tp_size
-            param.materialize(tuple(final_shape), dtype=loaded_weight.dtype)
+            param.materialize(final_shape, dtype=loaded_weight.dtype)
 
         expert_data = param.data if full_load else param.data[expert_id]
 
