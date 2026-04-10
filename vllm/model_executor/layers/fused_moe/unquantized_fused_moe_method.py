@@ -241,6 +241,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 w2=layer.w2_weight,
             )
 
+        if self.unquantized_backend in [
+            UnquantizedMoeBackend.TRITON,
+            UnquantizedMoeBackend.BATCHED_TRITON,
+        ]:
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                preload_runtime_moe_configs,
+            )
+
+            preload_runtime_moe_configs(
+                layer.w13_weight.size(),
+                layer.w2_weight.size(),
+                self.moe_quant_config.config_name(layer.w13_weight.dtype),
+                block_shape=self.moe_quant_config.block_shape,
+            )
+
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
         if self.moe.has_bias:
             return biased_moe_quant_config(

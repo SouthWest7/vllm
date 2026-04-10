@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
 
 def create_moe_runner(
     layer_name: str,
+    is_transformers_fused_moe: bool,
     moe_config: FusedMoEConfig,
     router: FusedMoERouter,
     routed_input_transform: torch.nn.Module | None,
@@ -37,6 +38,7 @@ def create_moe_runner(
 ) -> MoERunner:
     runner = DefaultMoERunner(
         layer_name,
+        is_transformers_fused_moe,
         moe_config,
         router,
         routed_input_transform,

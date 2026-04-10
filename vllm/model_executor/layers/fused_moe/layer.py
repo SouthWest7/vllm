@@ -574,6 +574,9 @@ class FusedMoE(CustomOp):
         # for MoE ops.
         self.runner = create_moe_runner(
             layer_name=self.layer_name,
+            is_transformers_fused_moe=(
+                getattr(self.__class__, "name", None) == "transformers_fused_moe"
+            ),
             moe_config=self.moe_config,
             router=self.router,
             routed_input_transform=self._routed_input_transform,
