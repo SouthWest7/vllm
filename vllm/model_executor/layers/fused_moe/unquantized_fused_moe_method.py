@@ -249,11 +249,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 preload_runtime_moe_configs,
             )
 
+            moe_quant_config = self.moe_quant_config
+            assert moe_quant_config is not None
             preload_runtime_moe_configs(
                 layer.w13_weight.size(),
                 layer.w2_weight.size(),
-                self.moe_quant_config.config_name(layer.w13_weight.dtype),
-                block_shape=self.moe_quant_config.block_shape,
+                moe_quant_config.config_name(layer.w13_weight.dtype),
+                block_shape=moe_quant_config.block_shape,
             )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
