@@ -17,6 +17,7 @@ from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
@@ -37,6 +38,8 @@ from vllm.utils.torch_utils import (
     ModuleName,
     direct_register_custom_op,
 )
+
+logger = init_logger(__name__)
 
 
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
@@ -227,18 +230,26 @@ class MoERunnerBase(MoERunner):
         self._quant_method_is_monolithic = bool(quant_method.is_monolithic)
 
     def _determine_forward_mode(self, is_transformers_fused_moe: bool) -> str:
-        supports_unwrapped_forward = (
-            not is_transformers_fused_moe
-            and self._shared_experts is None
-            and not self.enable_dbo
-            and not self.moe_config.moe_parallel_config.use_dp_chunking
-        )
-
         if envs.VLLM_FUSED_MOE_WRAP_MODE == "unwrapped":
-            if not supports_unwrapped_forward:
-                raise ValueError(
-                    "VLLM_FUSED_MOE_WRAP_MODE=unwrapped is only supported for "
-                    "native non-shared, non-DBO, non-chunking FusedMoE paths."
+            reasons = []
+            if is_transformers_fused_moe:
+                reasons.append("transformers fused MoE backend")
+            if self._shared_experts is not None:
+                reasons.append("shared experts enabled")
+            if self.enable_dbo:
+                reasons.append("DBO enabled")
+            if self.moe_config.moe_parallel_config.use_dp_chunking:
+                reasons.append("DP chunking enabled")
+
+            if reasons:
+                logger.warning_once(
+                    "Proceeding with "
+                    "VLLM_FUSED_MOE_WRAP_MODE=unwrapped for an unsupported "
+                    "FusedMoE path (%s). This is experimental and may fail; "
+                    "set VLLM_FUSED_MOE_WRAP_MODE=wrapped to restore the "
+                    "default wrapper.",
+                    ", ".join(reasons),
+                    scope="global",
                 )
             return "unwrapped"
 
@@ -466,9 +477,6 @@ class MoERunnerBase(MoERunner):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        assert self._shared_experts is None
-        assert not self.enable_dbo
-        assert not self.moe_config.moe_parallel_config.use_dp_chunking
         return self.forward_dispatch(
             get_layer_from_name(self.layer_name),
             hidden_states,
