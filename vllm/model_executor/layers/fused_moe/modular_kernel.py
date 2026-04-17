@@ -1081,10 +1081,20 @@ class FusedMoEKernelModularImpl:
         # time we need cache3, we're done with cache1.
         # Reuse workspace13 for the output since there is only one chunk.
         max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
-        common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
-            ((max_shape_size,), workspace_dtype),
-            (workspace2_shape, workspace_dtype),
-        )
+        if torch.compiler.is_compiling():
+            (common_workspace,) = current_workspace_manager().get_simultaneous(
+                ((max_shape_size,), workspace_dtype),
+            )
+            workspace2 = current_workspace_manager().get_independent(
+                "fused_moe_workspace2",
+                workspace2_shape,
+                workspace_dtype,
+            )
+        else:
+            common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
+                ((max_shape_size,), workspace_dtype),
+                (workspace2_shape, workspace_dtype),
+            )
         workspace13 = _resize_cache(common_workspace, workspace13_shape)
         fused_out = _resize_cache(common_workspace, fused_out_shape)
 

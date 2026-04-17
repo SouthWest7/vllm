@@ -42,6 +42,7 @@ class WorkspaceManager:
         self._current_workspaces: list[torch.Tensor | None] = [
             None
         ] * self._num_ubatches
+        self._independent_workspaces: dict[str, list[torch.Tensor | None]] = {}
         self._locked: bool = False
 
     @staticmethod
@@ -116,7 +117,23 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
-    def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
+    def get_independent(
+        self,
+        key: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Get a reusable zero-offset workspace for a specific key."""
+        actual_bytes = _compute_bytes(shape, dtype)
+        pool = self._independent_workspaces.setdefault(key, [None] * self._num_ubatches)
+        workspace = self._ensure_workspace_size(actual_bytes, workspace_pool=pool)
+        return workspace[:actual_bytes].view(dtype).reshape(shape)
+
+    def _ensure_workspace_size(
+        self,
+        required_bytes: int,
+        workspace_pool: list[torch.Tensor | None] | None = None,
+    ) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 
         Args:
@@ -125,8 +142,11 @@ class WorkspaceManager:
         Returns:
             The current workspace tensor.
         """
+        if workspace_pool is None:
+            workspace_pool = self._current_workspaces
+
         ubatch_id = dbo_current_ubatch_id()
-        current_workspace = self._current_workspaces[ubatch_id]
+        current_workspace = workspace_pool[ubatch_id]
         current_size = self._workspace_size_bytes(current_workspace)
 
         if current_size < required_bytes:
@@ -162,7 +182,7 @@ class WorkspaceManager:
                 )
 
             for ubatch_id in range(self._num_ubatches):
-                current_workspace = self._current_workspaces[ubatch_id]
+                current_workspace = workspace_pool[ubatch_id]
                 if (
                     current_workspace is None
                     or self._workspace_size_bytes(current_workspace) < required_bytes
@@ -172,9 +192,9 @@ class WorkspaceManager:
                     # memory before freeing old, which can cause OOM.
                     # Must clear the list reference first since local var
                     # is just a copy of the reference.
-                    self._current_workspaces[ubatch_id] = None
+                    workspace_pool[ubatch_id] = None
                     del current_workspace
-                    self._current_workspaces[ubatch_id] = torch.empty(
+                    workspace_pool[ubatch_id] = torch.empty(
                         (required_bytes,), dtype=torch.uint8, device=self._device
                     )
 
@@ -189,7 +209,7 @@ class WorkspaceManager:
                     required_bytes * self._num_ubatches / _MB,
                 )
 
-            current_workspace = self._current_workspaces[dbo_current_ubatch_id()]
+            current_workspace = workspace_pool[dbo_current_ubatch_id()]
 
         return current_workspace
 

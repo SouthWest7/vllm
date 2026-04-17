@@ -197,23 +197,6 @@ def preload_runtime_moe_configs(
     return _PRELOADED_MOE_CONFIG_RESOLVER.preload(E, N, dtype, block_shape)
 
 
-def _materialize_compile_safe_triton_output(x: torch.Tensor) -> torch.Tensor:
-    if not torch.compiler.is_compiling():
-        return x
-
-    # Triton wrapper functionalization may emit an invalid clone when the
-    # mutation target aliases a workspace view. Materialize a fresh output
-    # tensor during compile so the kernel writes into zero-offset storage.
-    shape = tuple(x.shape)
-    stride = tuple(x.stride())
-    return torch.empty_strided(
-        shape,
-        stride,
-        dtype=x.dtype,
-        device=x.device,
-    )
-
-
 @triton.jit
 def write_zeros_to_output(
     c_ptr,
@@ -2236,12 +2219,6 @@ class TritonExperts(mk.FusedMoEExpertsModular):
             workspace13, (num_tokens * top_k_num, cache2_dim)
         )
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
-        intermediate_cache1 = _materialize_compile_safe_triton_output(
-            intermediate_cache1
-        )
-        intermediate_cache3 = _materialize_compile_safe_triton_output(
-            intermediate_cache3
-        )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
