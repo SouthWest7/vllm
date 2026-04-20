@@ -810,6 +810,13 @@ class BitsAndBytesModelLoader(BaseModelLoader):
             **expert_quant_state_dict,
             **stacked_quant_state_dict,
         }
+        postprocess_quant_states = getattr(
+            model, "maybe_postprocess_bitsandbytes_quant_state_dict", None
+        )
+        if callable(postprocess_quant_states):
+            stacked_quant_state_dict = postprocess_quant_states(
+                stacked_quant_state_dict
+            )
         self._bind_quant_states_to_params(model, stacked_quant_state_dict)
         torch.accelerator.empty_cache()
 

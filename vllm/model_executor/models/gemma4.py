@@ -18,6 +18,7 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
+import copy
 from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
@@ -79,6 +80,42 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _duplicate_k_eq_v_bnb_quant_states(
+    config,
+    stacked_quant_state_dict: dict[str, dict[int, object]],
+    *,
+    prefix: str = "",
+) -> dict[str, dict[int, object]]:
+    """Mirror K quantization states onto V for Gemma4 k_eq_v layers.
+
+    Gemma4 full-attention layers can omit ``v_proj`` in the checkpoint and
+    instead reuse ``k_proj``. ``Gemma4ForCausalLM.load_weights()`` already
+    duplicates the packed K weights into V, but BitsAndBytes tracks quant
+    states separately and only sees the original checkpoint tensors. Without
+    duplicating the K quant state as well, BnB matmul reconstructs only Q+K
+    and drops the synthetic V shard.
+    """
+
+    if not getattr(config, "attention_k_eq_v", False):
+        return stacked_quant_state_dict
+
+    updated = dict(stacked_quant_state_dict)
+    for layer_idx, layer_type in enumerate(config.layer_types):
+        if layer_type != "full_attention":
+            continue
+
+        qkv_param_name = f"{prefix}model.layers.{layer_idx}.self_attn.qkv_proj.weight"
+        quant_states = updated.get(qkv_param_name)
+        if quant_states is None or 1 not in quant_states or 2 in quant_states:
+            continue
+
+        duplicated_quant_states = dict(quant_states)
+        duplicated_quant_states[2] = copy.deepcopy(quant_states[1])
+        updated[qkv_param_name] = duplicated_quant_states
+
+    return updated
 
 
 @triton.jit
@@ -1612,6 +1649,15 @@ class Gemma4ForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def maybe_postprocess_bitsandbytes_quant_state_dict(
+        self,
+        stacked_quant_state_dict: dict[str, dict[int, object]],
+    ) -> dict[str, dict[int, object]]:
+        return _duplicate_k_eq_v_bnb_quant_states(
+            self.config,
+            stacked_quant_state_dict,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Checkpoint weight names use "language_model." prefix (from the

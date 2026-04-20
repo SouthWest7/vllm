@@ -39,7 +39,10 @@ from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
-from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+from vllm.model_executor.models.gemma4 import (
+    Gemma4ForCausalLM,
+    _duplicate_k_eq_v_bnb_quant_states,
+)
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -1325,6 +1328,16 @@ class Gemma4ForConditionalGeneration(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
+
+    def maybe_postprocess_bitsandbytes_quant_state_dict(
+        self,
+        stacked_quant_state_dict: dict[str, dict[int, object]],
+    ) -> dict[str, dict[int, object]]:
+        return _duplicate_k_eq_v_bnb_quant_states(
+            self.config.text_config,
+            stacked_quant_state_dict,
+            prefix="language_model.",
+        )
 
     # ------------------------------------------------------------------ #
     # Weight loading
