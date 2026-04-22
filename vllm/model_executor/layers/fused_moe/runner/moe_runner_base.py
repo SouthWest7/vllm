@@ -182,7 +182,6 @@ class MoERunnerBase(MoERunner):
     def __init__(
         self,
         layer_name: str,
-        is_transformers_fused_moe: bool,
         moe_config: FusedMoEConfig,
         router: FusedMoERouter,
         routed_input_transform: torch.nn.Module | None,
@@ -219,7 +218,7 @@ class MoERunnerBase(MoERunner):
         # Needed for string -> FusedMoE layer lookup in custom ops.
         self.layer_name = layer_name
 
-        self.forward_mode = self._determine_forward_mode(is_transformers_fused_moe)
+        self.forward_mode = self._determine_forward_mode()
         self.forward_entry = self._select_forward()
         self._sync_quant_method_state(quant_method)
 
@@ -229,11 +228,9 @@ class MoERunnerBase(MoERunner):
         # the quant method property access inside the traced forward path.
         self._quant_method_is_monolithic = bool(quant_method.is_monolithic)
 
-    def _determine_forward_mode(self, is_transformers_fused_moe: bool) -> str:
+    def _determine_forward_mode(self) -> str:
         if envs.VLLM_FUSED_MOE_WRAP_MODE == "unwrapped":
             reasons = []
-            if is_transformers_fused_moe:
-                reasons.append("transformers fused MoE backend")
             if self._shared_experts is not None:
                 reasons.append("shared experts enabled")
             if self.enable_dbo:

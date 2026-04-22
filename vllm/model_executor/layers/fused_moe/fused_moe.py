@@ -67,7 +67,7 @@ def _build_moe_config_file_name(
     E: int,
     N: int,
     dtype: str | None,
-    block_shape: list[int] | None = None,
+    block_shape: list[int] | tuple[int, int] | None = None,
 ) -> str:
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
@@ -76,125 +76,68 @@ def _build_moe_config_file_name(
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
 
 
-class PreloadedMoEConfigResolver:
-    def __init__(self) -> None:
-        self._device_name: str | None = None
-        self._configs: dict[
-            tuple[int, int, str | None, tuple[int, int] | None],
-            dict[int, Any] | None,
-        ] = {}
+@functools.lru_cache(maxsize=1)
+def _get_moe_config_device_name() -> str:
+    device_name = current_platform.get_device_name().replace(" ", "_")
+    # Set device_name to H200 if a device from the H200 family is detected
+    if "H200" in device_name.split("_"):
+        device_name = "NVIDIA_H200"
+    return device_name
 
-    def _config_key(
-        self,
-        E: int,
-        N: int,
-        dtype: str | None,
-        block_shape: list[int] | None = None,
-    ) -> tuple[int, int, str | None, tuple[int, int] | None]:
-        return (E, N, dtype, _normalize_block_shape(block_shape))
 
-    def _get_device_name(self) -> str:
-        if self._device_name is None:
-            device_name = current_platform.get_device_name().replace(" ", "_")
-            # Set device_name to H200 if a device from the H200 family is detected
-            if "H200" in device_name.split("_"):
-                device_name = "NVIDIA_H200"
-            self._device_name = device_name
-        return self._device_name
-
-    def is_preloaded(
-        self,
-        E: int,
-        N: int,
-        dtype: str | None,
-        block_shape: list[int] | None = None,
-    ) -> bool:
-        return self._config_key(E, N, dtype, block_shape) in self._configs
-
-    def get_preloaded(
-        self,
-        E: int,
-        N: int,
-        dtype: str | None,
-        block_shape: list[int] | None = None,
-    ) -> dict[int, Any] | None:
-        return self._configs.get(self._config_key(E, N, dtype, block_shape))
-
-    def preload(
-        self,
-        E: int,
-        N: int,
-        dtype: str | None,
-        block_shape: list[int] | None = None,
-    ) -> dict[int, Any] | None:
-        key = self._config_key(E, N, dtype, block_shape)
-        if key in self._configs:
-            return self._configs[key]
-
-        if envs.VLLM_BATCH_INVARIANT:
-            self._configs[key] = None
-            return None
-
-        json_file_name = _build_moe_config_file_name(
-            self._get_device_name(),
-            E,
-            N,
-            dtype,
-            block_shape,
-        )
-
-        config_file_paths = []
-
-        user_defined_config_folder = envs.VLLM_TUNED_CONFIG_FOLDER
-        if user_defined_config_folder is not None:
-            config_file_paths.append(
-                os.path.join(user_defined_config_folder, json_file_name)
-            )
-
-        config_file_paths.append(
-            os.path.join(
-                os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-            )
-        )
-
-        for config_file_path in config_file_paths:
-            if os.path.exists(config_file_path):
-                with open(config_file_path) as f:
-                    logger.info_once(
-                        "Using configuration from %s for MoE layer.",
-                        config_file_path,
-                        scope="global",
-                    )
-                    tuned_config = json.load(f)
-                    tuned_config.pop("triton_version", None)
-                    self._configs[key] = {
-                        int(config_key): val for config_key, val in tuned_config.items()
-                    }
-                    return self._configs[key]
-
-        logger.warning_once(
-            "Using default MoE config. Performance might be sub-optimal! "
-            "Config file not found at %s",
-            ", ".join(config_file_paths),
-            scope="local",
-        )
-        self._configs[key] = None
+@functools.cache
+def _load_prebuilt_moe_configs(
+    E: int,
+    N: int,
+    dtype: str | None,
+    block_shape: tuple[int, int] | None = None,
+) -> dict[int, Any] | None:
+    if envs.VLLM_BATCH_INVARIANT:
         return None
 
+    json_file_name = _build_moe_config_file_name(
+        _get_moe_config_device_name(),
+        E,
+        N,
+        dtype,
+        block_shape,
+    )
 
-_PRELOADED_MOE_CONFIG_RESOLVER = PreloadedMoEConfigResolver()
+    config_file_paths = []
 
+    user_defined_config_folder = envs.VLLM_TUNED_CONFIG_FOLDER
+    if user_defined_config_folder is not None:
+        config_file_paths.append(
+            os.path.join(user_defined_config_folder, json_file_name)
+        )
 
-def preload_runtime_moe_configs(
-    w1_shape: tuple[int, ...],
-    w2_shape: tuple[int, ...],
-    dtype: str | None,
-    block_shape: list[int] | None = None,
-) -> dict[int, Any] | None:
-    E, _, N = w2_shape
-    if dtype == "int4_w4a16":
-        N = N * 2
-    return _PRELOADED_MOE_CONFIG_RESOLVER.preload(E, N, dtype, block_shape)
+    config_file_paths.append(
+        os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
+        )
+    )
+
+    for config_file_path in config_file_paths:
+        if os.path.exists(config_file_path):
+            with open(config_file_path) as f:
+                logger.info_once(
+                    "Using configuration from %s for MoE layer.",
+                    config_file_path,
+                    scope="global",
+                )
+                tuned_config = json.load(f)
+                tuned_config.pop("triton_version", None)
+                return {
+                    int(config_key): val for config_key, val in tuned_config.items()
+                }
+
+    logger.warning_once(
+        "Using default MoE config. Performance might be sub-optimal! "
+        "Config file not found at %s",
+        ", ".join(config_file_paths),
+        scope="local",
+    )
+    return None
 
 
 @triton.jit
@@ -1162,7 +1105,7 @@ def get_config_file_name(
     E: int, N: int, dtype: str | None, block_shape: list[int] | None = None
 ) -> str:
     return _build_moe_config_file_name(
-        _PRELOADED_MOE_CONFIG_RESOLVER._get_device_name(),
+        _get_moe_config_device_name(),
         E,
         N,
         dtype,
@@ -1468,6 +1411,7 @@ def try_get_optimal_moe_config(
     dtype: str | None,
     M: int,
     block_shape: list[int] | None = None,
+    configs: dict[int, Any] | None = None,
 ) -> dict[str, int]:
     from vllm.model_executor.layers.fused_moe import get_config
 
@@ -1475,20 +1419,7 @@ def try_get_optimal_moe_config(
     if override_config:
         config = override_config
     else:
-        # First try to load optimal config from the file
         E, _, N = w2_shape
-        if dtype == "int4_w4a16":
-            N = N * 2
-        configs = _PRELOADED_MOE_CONFIG_RESOLVER.get_preloaded(E, N, dtype, block_shape)
-        if (
-            configs is None
-            and not _PRELOADED_MOE_CONFIG_RESOLVER.is_preloaded(
-                E, N, dtype, block_shape
-            )
-            and not torch.compiler.is_compiling()
-        ):
-            configs = _PRELOADED_MOE_CONFIG_RESOLVER.preload(E, N, dtype, block_shape)
-
         if configs:
             # If an optimal configuration map has been found, look up the
             # optimal config
@@ -2050,6 +1981,33 @@ class TritonExperts(mk.FusedMoEExpertsModular):
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config, quant_config)
+        self._preloaded_moe_configs = self._preload_moe_configs()
+
+    def _preload_moe_configs(self) -> dict[str | None, dict[int, Any] | None]:
+        config_names = {
+            self.quant_config.config_name(self.moe_config.in_dtype),
+            self.quant_config.config_name(torch.float32),
+        }
+        E = self.moe_config.num_local_experts
+        N = self.moe_config.intermediate_size_per_partition
+        block_shape = _normalize_block_shape(self.block_shape)
+        return {
+            config_name: _load_prebuilt_moe_configs(
+                E,
+                N * 2 if config_name == "int4_w4a16" else N,
+                config_name,
+                block_shape,
+            )
+            for config_name in config_names
+        }
+
+    def _get_preloaded_moe_configs(
+        self,
+        hidden_states_dtype: torch.dtype,
+    ) -> dict[int, Any] | None:
+        return self._preloaded_moe_configs.get(
+            self.quant_config.config_name(hidden_states_dtype)
+        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -2196,6 +2154,7 @@ class TritonExperts(mk.FusedMoEExpertsModular):
             self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
             block_shape=self.block_shape,
+            configs=self._get_preloaded_moe_configs(hidden_states.dtype),
         )
 
         if hidden_states.dtype == torch.bfloat16:
@@ -2382,6 +2341,7 @@ class TritonWNA16Experts(TritonExperts):
             self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
             block_shape=self.block_shape,
+            configs=self._get_preloaded_moe_configs(hidden_states.dtype),
         )
 
         if hidden_states.dtype == torch.bfloat16:
