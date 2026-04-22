@@ -253,7 +253,7 @@ class MoERunnerBase(MoERunner):
                 reasons.append("shared experts enabled")
             if self.enable_dbo:
                 reasons.append("DBO enabled")
-            if self.moe_config.moe_parallel_config.use_dp_chunking:
+            if getattr(self.moe_config.moe_parallel_config, "use_dp_chunking", False):
                 reasons.append("DP chunking enabled")
 
             if reasons:
