@@ -54,92 +54,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
-def _normalize_block_shape(
-    block_shape: list[int] | None,
-) -> tuple[int, int] | None:
-    if not block_shape or not all(block_shape):
-        return None
-    return (block_shape[0], block_shape[1])
-
-
-def _build_moe_config_file_name(
-    device_name: str,
-    E: int,
-    N: int,
-    dtype: str | None,
-    block_shape: list[int] | tuple[int, int] | None = None,
-) -> str:
-    dtype_selector = "" if not dtype else f",dtype={dtype}"
-    block_shape_selector = (
-        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
-    ).replace(" ", "")
-    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
-
-
-@functools.lru_cache(maxsize=1)
-def _get_moe_config_device_name() -> str:
-    device_name = current_platform.get_device_name().replace(" ", "_")
-    # Set device_name to H200 if a device from the H200 family is detected
-    if "H200" in device_name.split("_"):
-        device_name = "NVIDIA_H200"
-    return device_name
-
-
-@functools.cache
-def _load_prebuilt_moe_configs(
-    E: int,
-    N: int,
-    dtype: str | None,
-    block_shape: tuple[int, int] | None = None,
-) -> dict[int, Any] | None:
-    if envs.VLLM_BATCH_INVARIANT:
-        return None
-
-    json_file_name = _build_moe_config_file_name(
-        _get_moe_config_device_name(),
-        E,
-        N,
-        dtype,
-        block_shape,
-    )
-
-    config_file_paths = []
-
-    user_defined_config_folder = envs.VLLM_TUNED_CONFIG_FOLDER
-    if user_defined_config_folder is not None:
-        config_file_paths.append(
-            os.path.join(user_defined_config_folder, json_file_name)
-        )
-
-    config_file_paths.append(
-        os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-        )
-    )
-
-    for config_file_path in config_file_paths:
-        if os.path.exists(config_file_path):
-            with open(config_file_path) as f:
-                logger.info_once(
-                    "Using configuration from %s for MoE layer.",
-                    config_file_path,
-                    scope="global",
-                )
-                tuned_config = json.load(f)
-                tuned_config.pop("triton_version", None)
-                return {
-                    int(config_key): val for config_key, val in tuned_config.items()
-                }
-
-    logger.warning_once(
-        "Using default MoE config. Performance might be sub-optimal! "
-        "Config file not found at %s",
-        ", ".join(config_file_paths),
-        scope="local",
-    )
-    return None
-
-
 @triton.jit
 def write_zeros_to_output(
     c_ptr,
@@ -1104,13 +1018,15 @@ def zero_experts_compute_triton(
 def get_config_file_name(
     E: int, N: int, dtype: str | None, block_shape: list[int] | None = None
 ) -> str:
-    return _build_moe_config_file_name(
-        _get_moe_config_device_name(),
-        E,
-        N,
-        dtype,
-        block_shape,
-    )
+    device_name = current_platform.get_device_name().replace(" ", "_")
+    # Set device_name to H200 if a device from the H200 family is detected
+    if "H200" in device_name.split("_"):
+        device_name = "NVIDIA_H200"
+    dtype_selector = "" if not dtype else f",dtype={dtype}"
+    block_shape_selector = (
+        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
+    ).replace(" ", "")
+    return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"  # noqa: E501
 
 
 # Adapted from: https://github.com/sgl-project/sglang/pull/2628
@@ -1410,7 +1326,6 @@ def try_get_optimal_moe_config(
     dtype: str | None,
     M: int,
     block_shape: list[int] | None = None,
-    configs: dict[int, Any] | None = None,
 ) -> dict[str, int]:
     from vllm.model_executor.layers.fused_moe import get_config
 
@@ -1418,7 +1333,14 @@ def try_get_optimal_moe_config(
     if override_config:
         config = override_config
     else:
+        # First try to load optimal config from the file
         E, _, N = w2_shape
+        if dtype == "int4_w4a16":
+            N = N * 2
+        block_n = block_shape[0] if block_shape else 0
+        block_k = block_shape[1] if block_shape else 0
+        configs = get_moe_configs(E, N, dtype, block_n, block_k)
+
         if configs:
             # If an optimal configuration map has been found, look up the
             # optimal config
@@ -1427,6 +1349,70 @@ def try_get_optimal_moe_config(
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, block_shape)
     return config
+
+
+def _get_runtime_moe_config_cases(
+    w1_shape: tuple[int, ...],
+    w2_shape: tuple[int, ...],
+    dtype: str | None,
+    block_shape: list[int] | None = None,
+) -> list[tuple[int | None, dict[str, Any]]] | None:
+    from vllm.model_executor.layers.fused_moe import get_config
+
+    override_config = get_config()
+    if override_config:
+        return [(None, override_config)]
+
+    E, _, N = w2_shape
+    if dtype == "int4_w4a16":
+        N = N * 2
+    block_n = block_shape[0] if block_shape else 0
+    block_k = block_shape[1] if block_shape else 0
+    configs = get_moe_configs(E, N, dtype, block_n, block_k)
+    if not configs:
+        return None
+
+    sorted_keys = sorted(configs)
+    config_cases: list[tuple[int | None, dict[str, Any]]] = []
+    for index, key in enumerate(sorted_keys):
+        next_key = sorted_keys[index + 1] if index + 1 < len(sorted_keys) else None
+        threshold = None if next_key is None else (key + next_key) // 2
+        config_cases.append((threshold, configs[key]))
+    return config_cases
+
+
+def _select_moe_config_with_torch_cond(
+    num_tokens: int,
+    config_cases: list[tuple[int | None, dict[str, Any]]],
+    apply_config: Callable[[dict[str, Any]], torch.Tensor],
+) -> torch.Tensor:
+    if len(config_cases) == 1:
+        return apply_config(config_cases[0][1])
+
+    threshold, config = config_cases[0]
+    assert threshold is not None
+    return torch.cond(
+        num_tokens <= threshold,
+        lambda: apply_config(config),
+        lambda: _select_moe_config_with_torch_cond(
+            num_tokens,
+            config_cases[1:],
+            apply_config,
+        ),
+        (),
+    )
+
+
+def _get_triton_moe_compute_type(hidden_states_dtype: torch.dtype):
+    if hidden_states_dtype == torch.bfloat16:
+        return tl.bfloat16
+    if hidden_states_dtype == torch.float16:
+        return tl.float16
+    if hidden_states_dtype == torch.float32:
+        return tl.float32
+    if hidden_states_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        return tl.bfloat16
+    raise ValueError(f"Unsupported compute_type: {hidden_states_dtype}")
 
 
 def inplace_fused_experts(
@@ -1642,31 +1628,18 @@ def _prepare_expert_assignment(
     ignore_invalid_experts: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Prepare expert assignments for the aligned and low-latency Triton paths."""
-    # SPARSITY_FACTOR is a heuristic margin ensuring tokens_in_chunk * top_k
-    # activates only a small fraction of total experts
-    # Skips moe_align_block_size and activates the `sorted_token_ids is None`
-    # path of the fused_moe_kernel kernel
-    naive_block_assignment = (
-        expert_map is None
-        and num_tokens * top_k_num * 4 <= global_num_experts
-        and not (
-            (use_int8_w8a16 or use_int4_w4a16)
-            and block_shape is not None
-            and block_shape[1] > 0
-        )
+    naive_block_assignment = _should_use_naive_expert_assignment(
+        num_tokens,
+        top_k_num,
+        global_num_experts,
+        expert_map,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        block_shape=block_shape,
     )
 
     if naive_block_assignment:
-        return (
-            None,
-            topk_ids.view(-1),
-            torch.full(
-                (1,),
-                topk_ids.numel() * config["BLOCK_SIZE_M"],
-                dtype=torch.int32,
-                device=topk_ids.device,
-            ),
-        )
+        return _prepare_naive_expert_assignment(topk_ids, config)
 
     return moe_align_block_size(
         topk_ids,
@@ -1674,6 +1647,61 @@ def _prepare_expert_assignment(
         global_num_experts,
         expert_map,
         ignore_invalid_experts=ignore_invalid_experts,
+    )
+
+
+def _supports_naive_expert_assignment(
+    expert_map: torch.Tensor | None,
+    *,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    block_shape: list[int] | None = None,
+) -> bool:
+    # SPARSITY_FACTOR is a heuristic margin ensuring tokens_in_chunk * top_k
+    # activates only a small fraction of total experts
+    # Skips moe_align_block_size and activates the `sorted_token_ids is None`
+    # path of the fused_moe_kernel kernel
+    return expert_map is None and not (
+        (use_int8_w8a16 or use_int4_w4a16)
+        and block_shape is not None
+        and block_shape[1] > 0
+    )
+
+
+def _should_use_naive_expert_assignment(
+    num_tokens: int,
+    top_k_num: int,
+    global_num_experts: int,
+    expert_map: torch.Tensor | None,
+    *,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    block_shape: list[int] | None = None,
+) -> bool:
+    return (
+        _supports_naive_expert_assignment(
+            expert_map,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            block_shape=block_shape,
+        )
+        and num_tokens * top_k_num * 4 <= global_num_experts
+    )
+
+
+def _prepare_naive_expert_assignment(
+    topk_ids: torch.Tensor,
+    config: dict[str, Any],
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    return (
+        None,
+        topk_ids.view(-1),
+        torch.full(
+            (1,),
+            topk_ids.numel() * config["BLOCK_SIZE_M"],
+            dtype=torch.int32,
+            device=topk_ids.device,
+        ),
     )
 
 
@@ -1976,33 +2004,6 @@ class TritonExperts(mk.FusedMoEExpertsModular):
         # higher-precision + activation QDQ.
         self.quantization_emulation = False
         super().__init__(moe_config, quant_config)
-        self._preloaded_moe_configs = self._preload_moe_configs()
-
-    def _preload_moe_configs(self) -> dict[str | None, dict[int, Any] | None]:
-        config_names = {
-            self.quant_config.config_name(self.moe_config.in_dtype),
-            self.quant_config.config_name(torch.float32),
-        }
-        E = self.moe_config.num_local_experts
-        N = self.moe_config.intermediate_size_per_partition
-        block_shape = _normalize_block_shape(self.block_shape)
-        return {
-            config_name: _load_prebuilt_moe_configs(
-                E,
-                N * 2 if config_name == "int4_w4a16" else N,
-                config_name,
-                block_shape,
-            )
-            for config_name in config_names
-        }
-
-    def _get_preloaded_moe_configs(
-        self,
-        hidden_states_dtype: torch.dtype,
-    ) -> dict[int, Any] | None:
-        return self._preloaded_moe_configs.get(
-            self.quant_config.config_name(hidden_states_dtype)
-        )
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -2086,6 +2087,192 @@ class TritonExperts(mk.FusedMoEExpertsModular):
         output = (M, K)
         return (workspace1, workspace2, output)
 
+    def _apply_with_runtime_config_out_of_place(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        config: dict[str, Any],
+        use_naive_block_assignment: bool,
+    ) -> torch.Tensor:
+        _, num_tokens, N, K, top_k_num = self.moe_problem_size(
+            hidden_states, w1, w2, topk_ids
+        )
+        compute_type = _get_triton_moe_compute_type(hidden_states.dtype)
+
+        intermediate_cache1 = torch.empty(
+            (num_tokens, top_k_num, N),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        cache2_dim = self.adjust_N_for_activation(N, activation)
+        intermediate_cache2 = torch.empty(
+            (num_tokens * top_k_num, cache2_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        intermediate_cache3 = torch.empty(
+            (num_tokens, top_k_num, K),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        if use_naive_block_assignment:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                _prepare_naive_expert_assignment(topk_ids, config)
+            )
+        else:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids,
+                config["BLOCK_SIZE_M"],
+                global_num_experts,
+                None,
+            )
+
+        invoke_fused_moe_triton_kernel(
+            hidden_states,
+            w1,
+            intermediate_cache1,
+            a1q_scale,
+            self.w1_scale,
+            None,  # topk_weights
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            False,  # mul_routed_weights
+            top_k_num,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
+            use_int8_w8a8=self.quant_config.use_int8_w8a8,
+            use_int8_w8a16=self.quant_config.use_int8_w8a16,
+            use_int4_w4a16=self.quant_config.use_int4_w4a16,
+            per_channel_quant=self.per_act_token_quant,
+            block_shape=self.block_shape,
+            B_bias=self.w1_bias,
+        )
+
+        self.activation(
+            activation, intermediate_cache2, intermediate_cache1.view(-1, N)
+        )
+
+        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+            intermediate_cache2,
+            a2_scale,
+            self.quant_dtype,
+            self.per_act_token_quant,
+            self.block_shape,
+            quantization_emulation=self.quantization_emulation,
+        )
+
+        invoke_fused_moe_triton_kernel(
+            qintermediate_cache2,
+            w2,
+            intermediate_cache3,
+            a2q_scale,
+            self.w2_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            not apply_router_weight_on_input,
+            1,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
+            use_int8_w8a8=self.quant_config.use_int8_w8a8,
+            use_int8_w8a16=self.quant_config.use_int8_w8a16,
+            use_int4_w4a16=self.quant_config.use_int4_w4a16,
+            per_channel_quant=self.per_act_token_quant,
+            block_shape=self.block_shape,
+            B_bias=self.w2_bias,
+        )
+
+        output = torch.empty(
+            (num_tokens, K),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        self.moe_sum(intermediate_cache3, output)
+        return output
+
+    def _apply_with_runtime_moe_config_selection(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        num_tokens: int,
+        top_k_num: int,
+        config_dtype: str | None,
+        config_cases: list[tuple[int | None, dict[str, Any]]] | None,
+        can_use_runtime_naive_assignment: bool,
+    ) -> torch.Tensor:
+        def apply_config(
+            config: dict[str, Any],
+            *,
+            use_naive_block_assignment: bool,
+        ) -> torch.Tensor:
+            return self._apply_with_runtime_config_out_of_place(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation,
+                global_num_experts,
+                a1q_scale,
+                a2_scale,
+                apply_router_weight_on_input,
+                config,
+                use_naive_block_assignment,
+            )
+
+        def apply_assignment_choice(use_naive_block_assignment: bool) -> torch.Tensor:
+            if config_cases is None:
+                config = try_get_optimal_moe_config(
+                    w1.size(),
+                    w2.size(),
+                    top_k_num,
+                    config_dtype,
+                    num_tokens,
+                    block_shape=self.block_shape,
+                )
+                return apply_config(
+                    config,
+                    use_naive_block_assignment=use_naive_block_assignment,
+                )
+            return _select_moe_config_with_torch_cond(
+                num_tokens,
+                config_cases,
+                lambda config: apply_config(
+                    config,
+                    use_naive_block_assignment=use_naive_block_assignment,
+                ),
+            )
+
+        if can_use_runtime_naive_assignment:
+            return torch.cond(
+                num_tokens * top_k_num * 4 <= global_num_experts,
+                lambda: apply_assignment_choice(True),
+                lambda: apply_assignment_choice(False),
+                (),
+            )
+        return apply_assignment_choice(False)
+
     def apply(
         self,
         output: torch.Tensor,
@@ -2131,29 +2318,56 @@ class TritonExperts(mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = E
 
+        config_dtype = self.quant_config.config_name(hidden_states.dtype)
+        config_cases = _get_runtime_moe_config_cases(
+            w1.size(),
+            w2.size(),
+            config_dtype,
+            block_shape=self.block_shape,
+        )
+        can_use_runtime_naive_assignment = _supports_naive_expert_assignment(
+            expert_map,
+            use_int8_w8a16=self.quant_config.use_int8_w8a16,
+            use_int4_w4a16=self.quant_config.use_int4_w4a16,
+            block_shape=self.block_shape,
+        )
+
+        if (
+            torch.compiler.is_compiling()
+            and expert_map is None
+            and (config_cases is not None or can_use_runtime_naive_assignment)
+        ):
+            output.copy_(
+                self._apply_with_runtime_moe_config_selection(
+                    hidden_states,
+                    w1,
+                    w2,
+                    topk_weights,
+                    topk_ids,
+                    activation,
+                    global_num_experts,
+                    a1q_scale,
+                    a2_scale,
+                    apply_router_weight_on_input,
+                    num_tokens,
+                    top_k_num,
+                    config_dtype,
+                    config_cases,
+                    can_use_runtime_naive_assignment,
+                )
+            )
+            return
+
         config = try_get_optimal_moe_config(
             w1.size(),
             w2.size(),
             top_k_num,
-            self.quant_config.config_name(hidden_states.dtype),
+            config_dtype,
             num_tokens,
             block_shape=self.block_shape,
-            configs=self._get_preloaded_moe_configs(hidden_states.dtype),
         )
 
-        if hidden_states.dtype == torch.bfloat16:
-            compute_type = tl.bfloat16
-        elif hidden_states.dtype == torch.float16:
-            compute_type = tl.float16
-        elif hidden_states.dtype == torch.float32:
-            compute_type = tl.float32
-        elif (
-            hidden_states.dtype == torch.float8_e4m3fn
-            or hidden_states.dtype == torch.float8_e4m3fnuz
-        ):
-            compute_type = tl.bfloat16
-        else:
-            raise ValueError(f"Unsupported compute_type: {hidden_states.dtype}")
+        compute_type = _get_triton_moe_compute_type(hidden_states.dtype)
 
         # Note that the output tensor might be in workspace1
         intermediate_cache1 = _resize_cache(workspace2, (num_tokens, top_k_num, N))
@@ -2336,7 +2550,6 @@ class TritonWNA16Experts(TritonExperts):
             self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
             block_shape=self.block_shape,
-            configs=self._get_preloaded_moe_configs(hidden_states.dtype),
         )
 
         if hidden_states.dtype == torch.bfloat16:

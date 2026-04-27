@@ -1085,10 +1085,10 @@ class FusedMoEKernelModularImpl:
             (common_workspace,) = current_workspace_manager().get_simultaneous(
                 ((max_shape_size,), workspace_dtype),
             )
-            workspace2 = current_workspace_manager().get_independent(
-                "fused_moe_workspace2",
+            workspace2 = torch.empty(
                 workspace2_shape,
-                workspace_dtype,
+                dtype=workspace_dtype,
+                device=device,
             )
         else:
             common_workspace, workspace2 = current_workspace_manager().get_simultaneous(

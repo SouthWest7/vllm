@@ -244,9 +244,16 @@ class MoERunner(MoERunnerInterface):
 
     def _sync_quant_method_state(self, quant_method: FusedMoEMethodBase) -> None:
         self.quant_method = quant_method
-        # Keep this as a plain bool so Dynamo does not need to reason about
-        # the quant method property access inside the traced forward path.
+        # Keep these as plain bools so Dynamo does not need to reason about
+        # quant method property access inside the traced forward path.
         self._quant_method_is_monolithic = bool(quant_method.is_monolithic)
+        self._quant_method_skip_forward_padding = bool(
+            quant_method.skip_forward_padding
+        )
+        moe_kernel = quant_method.moe_kernel
+        self._fused_output_is_reduced_value = bool(
+            moe_kernel is not None and moe_kernel.output_is_reduced()
+        )
 
     def _determine_forward_mode(self) -> str:
         if envs.VLLM_FUSED_MOE_WRAP_MODE == "unwrapped":
@@ -357,10 +364,7 @@ class MoERunner(MoERunnerInterface):
 
     @property
     def _fused_output_is_reduced(self) -> bool:
-        return (
-            self.quant_method.moe_kernel is not None
-            and self.quant_method.moe_kernel.output_is_reduced()
-        )
+        return self._fused_output_is_reduced_value
 
     def _maybe_reduce_shared_expert_output(
         self,
@@ -435,7 +439,7 @@ class MoERunner(MoERunnerInterface):
         )
         transformed_hidden_dim = hidden_states.shape[-1]
         if (
-            not self.quant_method.skip_forward_padding
+            not self._quant_method_skip_forward_padding
             and self.moe_config.hidden_dim != transformed_hidden_dim
         ):
             hidden_states = F.pad(
@@ -518,6 +522,8 @@ class MoERunner(MoERunnerInterface):
         local size tracking for proper token scatter/gather. Otherwise
         returns a no-op context.
         """
+        if not is_forward_context_available():
+            return nullcontext()
         ctx = get_forward_context()
         return (
             ctx.dp_metadata.sp_local_sizes(self.moe_config.sp_size)

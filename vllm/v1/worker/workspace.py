@@ -42,7 +42,6 @@ class WorkspaceManager:
         self._current_workspaces: list[torch.Tensor | None] = [
             None
         ] * self._num_ubatches
-        self._independent_workspaces: dict[str, list[torch.Tensor | None]] = {}
         self._locked: bool = False
 
     @staticmethod
@@ -117,23 +116,7 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
-    def get_independent(
-        self,
-        key: str,
-        shape: tuple[int, ...],
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Get a reusable zero-offset workspace for a specific key."""
-        actual_bytes = _compute_bytes(shape, dtype)
-        pool = self._independent_workspaces.setdefault(key, [None] * self._num_ubatches)
-        workspace = self._ensure_workspace_size(actual_bytes, workspace_pool=pool)
-        return workspace[:actual_bytes].view(dtype).reshape(shape)
-
-    def _ensure_workspace_size(
-        self,
-        required_bytes: int,
-        workspace_pool: list[torch.Tensor | None] | None = None,
-    ) -> torch.Tensor:
+    def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 
         Args:
@@ -142,11 +125,8 @@ class WorkspaceManager:
         Returns:
             The current workspace tensor.
         """
-        if workspace_pool is None:
-            workspace_pool = self._current_workspaces
-
         ubatch_id = dbo_current_ubatch_id()
-        current_workspace = workspace_pool[ubatch_id]
+        current_workspace = self._current_workspaces[ubatch_id]
         current_size = self._workspace_size_bytes(current_workspace)
 
         if current_size < required_bytes:
@@ -185,18 +165,19 @@ class WorkspaceManager:
             # ubatches resize lazily on their next get_simultaneous call.
             # Resizing all ubatches here would orphan the other ubatch's
             # old tensor when it still holds views into it (DBO leak).
-            workspace_pool[ubatch_id] = None
+            self._current_workspaces[ubatch_id] = None
             del current_workspace
             # Release the freed segment back to CUDA so the caching
             # allocator can reuse the GPU memory for the larger
             # allocation below. Without this, each resize may leave a
             # dead segment in reserved memory which can cause higher peak
             # memory usage.
-            torch.accelerator.empty_cache()
-            workspace_pool[ubatch_id] = torch.empty(
+            if not torch.compiler.is_compiling():
+                torch.accelerator.empty_cache()
+            self._current_workspaces[ubatch_id] = torch.empty(
                 (required_bytes,), dtype=torch.uint8, device=self._device
             )
-            current_workspace = workspace_pool[ubatch_id]
+            current_workspace = self._current_workspaces[ubatch_id]
 
             if envs.VLLM_DEBUG_WORKSPACE:
                 logger.info(
