@@ -1552,7 +1552,6 @@ class FusedMoE(PluggableLayer):
             hidden_states,
             router_logits,
             input_ids,
-            owner_layer=self,
         )
 
     @property

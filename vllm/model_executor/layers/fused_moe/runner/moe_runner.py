@@ -280,7 +280,7 @@ class MoERunner(MoERunnerInterface):
                 f"narrow unquantized compile path. Blockers: {reasons}."
             )
 
-        logger.info_once(
+        logger.debug_once(
             "Using unwrapped FusedMoE forward path for layer %s.",
             self.layer_name,
         )
@@ -571,12 +571,12 @@ class MoERunner(MoERunnerInterface):
 
     def _forward_unwrapped(
         self,
-        layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        layer = get_layer_from_name(_resolve_layer_name(self._encode_layer_name()))
         return self._forward_impl(
             layer,
             hidden_states,
@@ -590,7 +590,6 @@ class MoERunner(MoERunnerInterface):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
-        owner_layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
@@ -630,13 +629,7 @@ class MoERunner(MoERunnerInterface):
         hidden_dim_was_padded = hidden_states.shape[-1] > routed_hidden_dim
 
         if self.forward_mode == "unwrapped":
-            if owner_layer is None:
-                raise AssertionError(
-                    "owner_layer must be provided when using the unwrapped "
-                    "FusedMoE forward path."
-                )
             result = self._forward_unwrapped(
-                owner_layer,
                 hidden_states,
                 router_logits,
                 shared_experts_input,
