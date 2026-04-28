@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -17,6 +18,7 @@ from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
@@ -42,6 +44,8 @@ from vllm.utils.torch_utils import (
     LayerName,
     direct_register_custom_op,
 )
+
+logger = init_logger(__name__)
 
 
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:
@@ -241,6 +245,46 @@ class MoERunner(MoERunnerInterface):
         self.layer_name = layer_name
 
         self._forward_entry = self._select_forward()
+        self.forward_mode = self._determine_forward_mode()
+        self._sync_quant_method_state(quant_method)
+
+    def _sync_quant_method_state(self, quant_method: FusedMoEMethodBase) -> None:
+        self.quant_method = quant_method
+        # Flatten compile-relevant quant method state onto the runner so
+        # Dynamo does not need to reason about Python property access.
+        self._quant_method_is_monolithic = bool(quant_method.is_monolithic)
+        self._quant_method_skip_forward_padding = bool(
+            quant_method.skip_forward_padding
+        )
+        moe_kernel = quant_method.moe_kernel
+        self._fused_output_is_reduced_value = bool(
+            moe_kernel is not None and moe_kernel.output_is_reduced()
+        )
+
+    def _determine_forward_mode(self) -> str:
+        if envs.VLLM_FUSED_MOE_WRAP_MODE == "wrapped":
+            return "wrapped"
+
+        blockers: list[str] = []
+        if not current_platform.is_cuda_alike():
+            blockers.append("requires a CUDA-alike platform")
+        if self._shared_experts is not None:
+            blockers.append("shared experts are enabled")
+        if self.enable_dbo:
+            blockers.append("DBO is enabled")
+
+        if blockers:
+            reasons = ", ".join(blockers)
+            raise NotImplementedError(
+                "VLLM_FUSED_MOE_WRAP_MODE=unwrapped is only supported for the "
+                f"narrow unquantized compile path. Blockers: {reasons}."
+            )
+
+        logger.info_once(
+            "Using unwrapped FusedMoE forward path for layer %s.",
+            self.layer_name,
+        )
+        return "unwrapped"
 
     def _select_forward(self) -> Callable:
         if current_platform.is_tpu() or current_platform.is_cpu():
@@ -263,7 +307,7 @@ class MoERunner(MoERunnerInterface):
     def _replace_quant_method(self, quant_method: FusedMoEMethodBase):
         if self._shared_experts is not None:
             self._shared_experts._quant_method = quant_method
-        self.quant_method = quant_method
+        self._sync_quant_method_state(quant_method)
 
     def is_internal_router(self) -> bool:
         return self.gate is not None
@@ -329,10 +373,7 @@ class MoERunner(MoERunnerInterface):
 
     @property
     def _fused_output_is_reduced(self) -> bool:
-        return (
-            self.quant_method.moe_kernel is not None
-            and self.quant_method.moe_kernel.output_is_reduced()
-        )
+        return self._fused_output_is_reduced_value
 
     def _maybe_reduce_shared_expert_output(
         self,
@@ -407,7 +448,7 @@ class MoERunner(MoERunnerInterface):
         )
         transformed_hidden_dim = hidden_states.shape[-1]
         if (
-            not self.quant_method.skip_forward_padding
+            not self._quant_method_skip_forward_padding
             and self.moe_config.hidden_dim != transformed_hidden_dim
         ):
             hidden_states = F.pad(
@@ -451,7 +492,7 @@ class MoERunner(MoERunnerInterface):
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
 
-        if self.quant_method.is_monolithic:
+        if self._quant_method_is_monolithic:
             fused_out = self.quant_method.apply_monolithic(
                 layer=layer,
                 x=hidden_states,
@@ -528,11 +569,28 @@ class MoERunner(MoERunnerInterface):
             result = result + zero_expert_output
         return result
 
+    def _forward_unwrapped(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self._forward_impl(
+            layer,
+            hidden_states,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        owner_layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
         """Invoke the fused moe layer.
 
@@ -571,13 +629,27 @@ class MoERunner(MoERunnerInterface):
         )
         hidden_dim_was_padded = hidden_states.shape[-1] > routed_hidden_dim
 
-        result = self._forward_entry(
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
-            self._encode_layer_name(),
-        )
+        if self.forward_mode == "unwrapped":
+            if owner_layer is None:
+                raise AssertionError(
+                    "owner_layer must be provided when using the unwrapped "
+                    "FusedMoE forward path."
+                )
+            result = self._forward_unwrapped(
+                owner_layer,
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            )
+        else:
+            result = self._forward_entry(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+                self._encode_layer_name(),
+            )
 
         #
         # Note: there are two all-reduce points below. They are mutually
