@@ -1040,6 +1040,7 @@ class FusedMoEKernelModularImpl:
 
     def _allocate_buffers(
         self,
+        reference: torch.Tensor,
         out_dtype: torch.dtype,
         device: torch.device,
         M_chunk: int,
@@ -1089,25 +1090,37 @@ class FusedMoEKernelModularImpl:
         )
 
         if envs.VLLM_FUSED_MOE_WRAP_MODE == "unwrapped":
-            # In the unwrapped compile path, Inductor traces these allocations
-            # directly. Avoid WorkspaceManager's uint8 storage/view plumbing,
-            # which is designed for eager custom-op execution and produces
-            # fragile dtype reinterpret views inside AOT graphs.
-            workspace13 = torch.empty(
-                workspace13_shape,
-                dtype=workspace_dtype,
-                device=device,
-            )
-            workspace2 = torch.empty(
-                workspace2_shape,
-                dtype=workspace_dtype,
-                device=device,
-            )
-            fused_out = torch.empty(
-                fused_out_shape,
-                dtype=workspace_dtype,
-                device=device,
-            )
+            max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+            if torch.compiler.is_compiling():
+                if workspace_dtype == reference.dtype:
+                    common_workspace, workspace2_flat = (
+                        torch.ops.vllm.fused_moe_workspace(
+                            reference,
+                            max_shape_size,
+                            prod(workspace2_shape),
+                        )
+                    )
+                    workspace2 = _resize_cache(workspace2_flat, workspace2_shape)
+                else:
+                    common_workspace = torch.empty(
+                        (max_shape_size,),
+                        dtype=workspace_dtype,
+                        device=device,
+                    )
+                    workspace2 = torch.empty(
+                        workspace2_shape,
+                        dtype=workspace_dtype,
+                        device=device,
+                    )
+            else:
+                common_workspace, workspace2 = (
+                    current_workspace_manager().get_simultaneous(
+                        ((max_shape_size,), workspace_dtype),
+                        (workspace2_shape, workspace_dtype),
+                    )
+                )
+            workspace13 = _resize_cache(common_workspace, workspace13_shape)
+            fused_out = _resize_cache(common_workspace, fused_out_shape)
         else:
             # We can reuse the memory between cache1 and cache3 because by the
             # time we need cache3, we're done with cache1.
@@ -1251,6 +1264,7 @@ class FusedMoEKernelModularImpl:
             return torch.empty_like(a1q, dtype=in_dtype)
 
         workspace13, workspace2, fused_out = self._allocate_buffers(
+            a1q,
             in_dtype,
             a1q.device,
             M_full,

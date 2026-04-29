@@ -11,6 +11,7 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import round_up
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 logger = init_logger(__name__)
@@ -42,6 +43,7 @@ class WorkspaceManager:
         self._current_workspaces: list[torch.Tensor | None] = [
             None
         ] * self._num_ubatches
+        self._independent_workspaces: dict[str, list[torch.Tensor | None]] = {}
         self._locked: bool = False
 
     @staticmethod
@@ -116,7 +118,25 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
-    def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
+    def get_independent(
+        self,
+        key: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Get a reusable zero-offset workspace for a specific key."""
+        actual_bytes = _compute_bytes(shape, dtype)
+        workspace_pool = self._independent_workspaces.setdefault(
+            key, [None] * self._num_ubatches
+        )
+        workspace = self._ensure_workspace_size(actual_bytes, workspace_pool)
+        return workspace[:actual_bytes].view(dtype).reshape(shape)
+
+    def _ensure_workspace_size(
+        self,
+        required_bytes: int,
+        workspace_pool: list[torch.Tensor | None] | None = None,
+    ) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 
         Args:
@@ -125,8 +145,11 @@ class WorkspaceManager:
         Returns:
             The current workspace tensor.
         """
+        if workspace_pool is None:
+            workspace_pool = self._current_workspaces
+
         ubatch_id = dbo_current_ubatch_id()
-        current_workspace = self._current_workspaces[ubatch_id]
+        current_workspace = workspace_pool[ubatch_id]
         current_size = self._workspace_size_bytes(current_workspace)
 
         if current_size < required_bytes:
@@ -165,7 +188,7 @@ class WorkspaceManager:
             # ubatches resize lazily on their next get_simultaneous call.
             # Resizing all ubatches here would orphan the other ubatch's
             # old tensor when it still holds views into it (DBO leak).
-            self._current_workspaces[ubatch_id] = None
+            workspace_pool[ubatch_id] = None
             del current_workspace
             # Release the freed segment back to CUDA so the caching
             # allocator can reuse the GPU memory for the larger
@@ -174,10 +197,10 @@ class WorkspaceManager:
             # memory usage.
             if not torch.compiler.is_compiling():
                 torch.accelerator.empty_cache()
-            self._current_workspaces[ubatch_id] = torch.empty(
+            workspace_pool[ubatch_id] = torch.empty(
                 (required_bytes,), dtype=torch.uint8, device=self._device
             )
-            current_workspace = self._current_workspaces[ubatch_id]
+            current_workspace = workspace_pool[ubatch_id]
 
             if envs.VLLM_DEBUG_WORKSPACE:
                 logger.info(
@@ -278,3 +301,43 @@ def reset_workspace_manager() -> None:
     """
     global _manager
     _manager = None
+
+
+def fused_moe_workspace(
+    reference: torch.Tensor,
+    common_numel: int,
+    workspace2_numel: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    workspace_manager = current_workspace_manager()
+    (common_workspace,) = workspace_manager.get_simultaneous(
+        ((common_numel,), reference.dtype),
+    )
+    workspace2 = workspace_manager.get_independent(
+        "fused_moe_workspace2",
+        (workspace2_numel,),
+        reference.dtype,
+    )
+    return common_workspace, workspace2
+
+
+def fused_moe_workspace_fake(
+    reference: torch.Tensor,
+    common_numel: int,
+    workspace2_numel: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty((common_numel,), dtype=reference.dtype, device=reference.device),
+        torch.empty(
+            (workspace2_numel,),
+            dtype=reference.dtype,
+            device=reference.device,
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="fused_moe_workspace",
+    op_func=fused_moe_workspace,
+    fake_impl=fused_moe_workspace_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
