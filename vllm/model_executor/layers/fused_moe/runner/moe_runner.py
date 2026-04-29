@@ -155,6 +155,33 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
+def _moe_apply(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    return layer.runner.quant_method.apply(
+        layer=layer,
+        x=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        shared_experts_input=shared_experts_input,
+    )
+
+
+def _moe_apply_fake(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
 direct_register_custom_op(
     op_name="moe_forward",
     op_func=_moe_forward,
@@ -168,6 +195,15 @@ direct_register_custom_op(
     op_name="moe_forward_shared",
     op_func=_moe_forward_shared,
     fake_impl=_moe_forward_shared_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+direct_register_custom_op(
+    op_name="moe_apply",
+    op_func=_moe_apply,
+    mutates_args=["hidden_states"],
+    fake_impl=_moe_apply_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -508,13 +544,22 @@ class MoERunner(MoERunnerInterface):
 
             # Passing shared_experts_input in case SharedExpertsOrder is
             # MK_INTERNAL_OVERLAPPED.
-            fused_out = self.quant_method.apply(
-                layer=layer,
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts_input=shared_experts_input,
-            )
+            if self.forward_mode == "unwrapped" and torch.compiler.is_compiling():
+                fused_out = torch.ops.vllm.moe_apply(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    shared_experts_input,
+                    self._encode_layer_name(),
+                )
+            else:
+                fused_out = self.quant_method.apply(
+                    layer=layer,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts_input=shared_experts_input,
+                )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
