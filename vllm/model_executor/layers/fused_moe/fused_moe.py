@@ -1212,8 +1212,24 @@ def get_moe_wna16_block_config(
 def should_moe_wna16_use_cuda(
     num_valid_tokens: int, group_size: int, num_experts: int, bit: int
 ):
+    return _should_moe_wna16_use_cuda_static(
+        num_valid_tokens,
+        group_size,
+        num_experts,
+        bit,
+        current_platform.is_cuda(),
+    )
+
+
+def _should_moe_wna16_use_cuda_static(
+    num_valid_tokens: int,
+    group_size: int,
+    num_experts: int,
+    bit: int,
+    is_cuda: bool,
+):
     return (
-        current_platform.is_cuda()
+        is_cuda
         and bit == 4
         and group_size in [32, 64, 128]
         and num_valid_tokens / num_experts <= 6
@@ -1228,6 +1244,31 @@ def get_default_config(
     topk: int,
     dtype: str | None,
     block_shape: list[int] | None = None,
+) -> dict[str, int]:
+    return _get_default_config_static(
+        M,
+        E,
+        N,
+        K,
+        topk,
+        dtype,
+        block_shape,
+        is_cuda=current_platform.is_cuda(),
+        is_rocm=current_platform.is_rocm(),
+    )
+
+
+def _get_default_config_static(
+    M: int,
+    E: int,
+    N: int,
+    K: int,
+    topk: int,
+    dtype: str | None,
+    block_shape: list[int] | None = None,
+    *,
+    is_cuda: bool,
+    is_rocm: bool,
 ) -> dict[str, int]:
     if envs.VLLM_BATCH_INVARIANT:
         return {
@@ -1254,14 +1295,16 @@ def get_default_config(
             "GROUP_SIZE_M": 1 if M <= 16 else 32,
             "SPLIT_K": 1,
             "num_warps": 4,
-            "num_stages": 3 if not current_platform.is_rocm() else num_stages_rocm,
+            "num_stages": 3 if not is_rocm else num_stages_rocm,
         }
     elif dtype in ["int4_w4a16", "int8_w8a16"] and block_shape is not None:
         # moe wna16 kernels
         # only set BLOCK_SIZE_M
         # BLOCK_SIZE_N and BLOCK_SIZE_K would be set later
         bit = 4 if dtype == "int4_w4a16" else 8
-        use_moe_wna16_cuda = should_moe_wna16_use_cuda(M * topk, block_shape[1], E, bit)
+        use_moe_wna16_cuda = _should_moe_wna16_use_cuda_static(
+            M * topk, block_shape[1], E, bit, is_cuda
+        )
         if use_moe_wna16_cuda:
             config = {"BLOCK_SIZE_M": min(16, M), "SPLIT_K": 1}
         elif M <= 20:
@@ -1301,7 +1344,7 @@ def get_default_config(
         # use more warps per block to increase arithmetic intensity.
         num_warps = 4 if M <= 128 else 8
 
-        if current_platform.is_rocm():
+        if is_rocm:
             num_stages = num_stages_rocm
         elif M <= 32:
             num_stages = 4
@@ -1318,6 +1361,89 @@ def get_default_config(
             "num_stages": num_stages,
         }
     return config
+
+
+class MoEConfigSelector:
+    """Pre-resolved MoE config lookup used by compile-unwrapped experts."""
+
+    def __init__(
+        self,
+        *,
+        E: int,
+        N: int,
+        K: int,
+        top_k: int,
+        dtype: str | None,
+        block_shape: list[int] | None,
+        override_config: dict[str, int] | None,
+        configs: dict[int, Any] | None,
+        is_cuda: bool,
+        is_rocm: bool,
+    ) -> None:
+        self.E = E
+        self.N = N
+        self.K = K
+        self.top_k = top_k
+        self.dtype = dtype
+        self.block_shape = block_shape
+        self.override_config = override_config
+        self.configs = configs
+        self.is_cuda = is_cuda
+        self.is_rocm = is_rocm
+
+    @classmethod
+    def from_quant_config(
+        cls,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+    ) -> "MoEConfigSelector":
+        from vllm.model_executor.layers.fused_moe import get_config
+
+        config_dtype = quant_config.config_name(moe_config.in_dtype)
+        E = moe_config.num_local_experts
+        N = moe_config.intermediate_size_per_partition
+        if config_dtype == "int4_w4a16":
+            N = N * 2
+        K = moe_config.hidden_dim
+        block_shape = quant_config.block_shape
+        block_n = block_shape[0] if block_shape else 0
+        block_k = block_shape[1] if block_shape else 0
+
+        override_config = get_config()
+        configs = None
+        if not override_config:
+            configs = get_moe_configs(E, N, config_dtype, block_n, block_k)
+
+        return cls(
+            E=E,
+            N=N,
+            K=K,
+            top_k=moe_config.experts_per_token,
+            dtype=config_dtype,
+            block_shape=block_shape,
+            override_config=override_config,
+            configs=configs,
+            is_cuda=current_platform.is_cuda(),
+            is_rocm=current_platform.is_rocm(),
+        )
+
+    def select(self, M: int) -> dict[str, int]:
+        if self.override_config:
+            return dict(self.override_config)
+        if self.configs:
+            key = min(self.configs.keys(), key=lambda x: abs(x - M))
+            return dict(self.configs[key])
+        return _get_default_config_static(
+            M,
+            self.E,
+            self.N,
+            self.K,
+            self.top_k,
+            self.dtype,
+            self.block_shape,
+            is_cuda=self.is_cuda,
+            is_rocm=self.is_rocm,
+        )
 
 
 def try_get_optimal_moe_config(
@@ -1898,6 +2024,14 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # Whether quantized MOE runs natively, or through
         # higher-precision + activation QDQ.
         self.quantization_emulation = False
+        self.config_selector = (
+            MoEConfigSelector.from_quant_config(
+                moe_config,
+                quant_config,
+            )
+            if envs.VLLM_FUSED_MOE_WRAP_MODE == "unwrapped"
+            else None
+        )
         super().__init__(moe_config, quant_config)
 
     @staticmethod
@@ -2027,14 +2161,17 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = E
 
-        config = try_get_optimal_moe_config(
-            w1.size(),
-            w2.size(),
-            top_k_num,
-            self.quant_config.config_name(hidden_states.dtype),
-            num_tokens,
-            block_shape=self.block_shape,
-        )
+        if self.config_selector is not None:
+            config = self.config_selector.select(num_tokens)
+        else:
+            config = try_get_optimal_moe_config(
+                w1.size(),
+                w2.size(),
+                top_k_num,
+                self.quant_config.config_name(hidden_states.dtype),
+                num_tokens,
+                block_shape=self.block_shape,
+            )
 
         if hidden_states.dtype == torch.bfloat16:
             compute_type = tl.bfloat16
@@ -2270,14 +2407,17 @@ class TritonWNA16Experts(TritonExperts):
         if global_num_experts == -1:
             global_num_experts = E
 
-        config = try_get_optimal_moe_config(
-            w1.size(),
-            w2.size(),
-            top_k_num,
-            self.quant_config.config_name(hidden_states.dtype),
-            num_tokens,
-            block_shape=self.block_shape,
-        )
+        if self.config_selector is not None:
+            config = self.config_selector.select(num_tokens)
+        else:
+            config = try_get_optimal_moe_config(
+                w1.size(),
+                w2.size(),
+                top_k_num,
+                self.quant_config.config_name(hidden_states.dtype),
+                num_tokens,
+                block_shape=self.block_shape,
+            )
 
         if hidden_states.dtype == torch.bfloat16:
             compute_type = tl.bfloat16
