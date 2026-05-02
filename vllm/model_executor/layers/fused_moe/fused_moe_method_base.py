@@ -154,6 +154,30 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 return False
         return self.moe_kernel.is_monolithic
 
+    def apply_moe_kernel(
+        self,
+        layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_map: torch.Tensor | None,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert self.moe_kernel is not None
+        return self.moe_kernel.apply_compile_boundary(
+            layer_name=layer.layer_name,
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=layer.activation,
+            global_num_experts=layer.global_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            shared_experts_input=shared_experts_input,
+        )
+
     def apply(
         self,
         layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821

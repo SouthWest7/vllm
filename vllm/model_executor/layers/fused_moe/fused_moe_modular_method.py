@@ -92,16 +92,11 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        assert self.moe_kernel is not None
-        return self.moe_kernel.apply(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
+        return self.apply_moe_kernel(
+            layer=layer,
+            x=x,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            activation=layer.activation,
-            global_num_experts=layer.global_num_experts,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
             expert_map=None if self.disable_expert_map else layer.expert_map,
             shared_experts_input=shared_experts_input,
         )

@@ -5,11 +5,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from math import prod
-from typing import final
+from typing import TYPE_CHECKING, final
 
 import torch
 
 import vllm.envs as envs
+from vllm.forward_context import (
+    ForwardContext,
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -33,6 +38,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import (
+    _USE_LAYERNAME,
+    LayerName,
+    direct_register_custom_op,
+)
 from vllm.v1.worker.ubatching import (
     dbo_enabled,
     dbo_maybe_run_recv_hook,
@@ -42,6 +52,98 @@ from vllm.v1.worker.ubatching import (
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+
+def get_layer_from_name(layer_name: str) -> torch.nn.Module:
+    forward_context: ForwardContext = get_forward_context()
+    if not _USE_LAYERNAME and layer_name == "from_forward_context":
+        all_moe_layers = forward_context.all_moe_layers
+        assert all_moe_layers is not None
+        moe_layer_index = forward_context.moe_layer_index
+        if moe_layer_index >= len(all_moe_layers):
+            raise AssertionError(
+                "We expected the number of MOE layers in `all_moe_layers` "
+                "to be equal to the number of "
+                "{vllm.moe_forward, vllm.moe_forward_shared, "
+                "vllm.moe_modular_apply} calls."
+            )
+        layer_name = all_moe_layers[moe_layer_index]
+        forward_context.moe_layer_index += 1
+    return forward_context.no_compile_layers[layer_name]
+
+
+if TYPE_CHECKING:
+    from typing import TypeAlias
+
+    _layer_name_type: TypeAlias = str | LayerName
+else:
+    _layer_name_type = LayerName if _USE_LAYERNAME else str
+
+
+@torch.compiler.assume_constant_result
+def _resolve_layer_name(layer_name: str | LayerName) -> str:
+    from torch._library.fake_class_registry import FakeScriptObject
+
+    if isinstance(layer_name, LayerName):
+        return layer_name.value
+    elif isinstance(layer_name, FakeScriptObject):
+        return layer_name.real_obj.value
+    return layer_name
+
+
+def _encode_layer_name(layer_name: str) -> str | LayerName:
+    if _USE_LAYERNAME:
+        return LayerName(layer_name)
+    if (
+        is_forward_context_available()
+        and get_forward_context().all_moe_layers is not None
+    ):
+        return "from_forward_context"
+    return layer_name
+
+
+def _moe_modular_apply(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    quant_method = layer.quant_method
+    moe_kernel = quant_method.moe_kernel
+    assert moe_kernel is not None
+    disable_expert_map = getattr(quant_method, "disable_expert_map", False)
+    return moe_kernel.apply(
+        hidden_states=hidden_states,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=layer.activation,
+        global_num_experts=layer.global_num_experts,
+        apply_router_weight_on_input=layer.apply_router_weight_on_input,
+        expert_map=None if disable_expert_map else layer.expert_map,
+        shared_experts_input=shared_experts_input,
+    )
+
+
+def _moe_modular_apply_fake(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="moe_modular_apply",
+    op_func=_moe_modular_apply,
+    fake_impl=_moe_modular_apply_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
@@ -1611,6 +1713,50 @@ class FusedMoEKernel:
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        return self.impl.apply(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            shared_experts_input=shared_experts_input,
+        )
+
+    def apply_compile_boundary(
+        self,
+        layer_name: str,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        shared_experts_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert isinstance(self.impl, FusedMoEKernelModularImpl)
+        if (
+            envs.VLLM_FUSED_MOE_WRAP_MODE == "unwrapped"
+            and torch.compiler.is_compiling()
+        ):
+            if self.impl.inplace:
+                raise NotImplementedError(
+                    "Unwrapped modular MoE compile boundary does not support "
+                    "in-place kernels yet."
+                )
+            return torch.ops.vllm.moe_modular_apply(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                shared_experts_input,
+                _encode_layer_name(layer_name),
+            )
         return self.impl.apply(
             hidden_states=hidden_states,
             w1=w1,
