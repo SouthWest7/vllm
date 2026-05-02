@@ -54,21 +54,33 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 
-def get_layer_from_name(layer_name: str) -> torch.nn.Module:
+def get_layer_from_name(
+    layer_name: str,
+    *,
+    advance_moe_layer_index: bool = True,
+) -> torch.nn.Module:
     forward_context: ForwardContext = get_forward_context()
     if not _USE_LAYERNAME and layer_name == "from_forward_context":
         all_moe_layers = forward_context.all_moe_layers
         assert all_moe_layers is not None
         moe_layer_index = forward_context.moe_layer_index
+        if not advance_moe_layer_index:
+            moe_layer_index -= 1
         if moe_layer_index >= len(all_moe_layers):
             raise AssertionError(
                 "We expected the number of MOE layers in `all_moe_layers` "
                 "to be equal to the number of "
                 "{vllm.moe_forward, vllm.moe_forward_shared, "
-                "vllm.moe_modular_apply} calls."
+                "vllm.moe_modular_prepare} calls."
+            )
+        if moe_layer_index < 0:
+            raise AssertionError(
+                "vllm.moe_modular_experts/finalize must follow "
+                "vllm.moe_modular_prepare for the same layer."
             )
         layer_name = all_moe_layers[moe_layer_index]
-        forward_context.moe_layer_index += 1
+        if advance_moe_layer_index:
+            forward_context.moe_layer_index += 1
     return forward_context.no_compile_layers[layer_name]
 
 
@@ -102,46 +114,166 @@ def _encode_layer_name(layer_name: str) -> str | LayerName:
     return layer_name
 
 
-def _moe_modular_apply(
+def _get_modular_impl_from_name(
+    layer_name: str,
+    *,
+    advance_moe_layer_index: bool,
+) -> "FusedMoEKernelModularImpl":
+    layer = get_layer_from_name(
+        layer_name,
+        advance_moe_layer_index=advance_moe_layer_index,
+    )
+    moe_kernel = layer.quant_method.moe_kernel
+    assert moe_kernel is not None
+    impl = moe_kernel.impl
+    assert isinstance(impl, FusedMoEKernelModularImpl)
+    return impl
+
+
+def _moe_modular_prepare(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    global_num_experts: int,
+    apply_router_weight_on_input: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    impl = _get_modular_impl_from_name(
+        _resolve_layer_name(layer_name),
+        advance_moe_layer_index=True,
+    )
+    a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = impl._prepare(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        global_num_experts=global_num_experts,
+        expert_map=expert_map,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+    )
+    assert a1q_scale is None
+    assert expert_tokens_meta is None
+    assert a1q is hidden_states
+    return topk_ids.clone(), topk_weights.clone()
+
+
+def _moe_modular_prepare_fake(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    global_num_experts: int,
+    apply_router_weight_on_input: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(topk_ids), torch.empty_like(topk_weights)
+
+
+def _moe_modular_experts(
+    a1q: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    activation: str,
+    global_num_experts: int,
+    local_num_experts: int,
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    impl = _get_modular_impl_from_name(
+        _resolve_layer_name(layer_name),
+        advance_moe_layer_index=False,
+    )
+    return impl._fused_experts(
+        in_dtype=a1q.dtype,
+        a1q=a1q,
+        a1q_scale=None,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=MoEActivation.from_str(activation),
+        global_num_experts=global_num_experts,
+        local_num_experts=local_num_experts,
+        expert_map=expert_map,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        expert_tokens_meta=None,
+    )
+
+
+def _moe_modular_experts_fake(
+    a1q: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    activation: str,
+    global_num_experts: int,
+    local_num_experts: int,
+    apply_router_weight_on_input: bool,
+) -> torch.Tensor:
+    return torch.empty_like(a1q)
+
+
+def _moe_modular_finalize(
+    fused_out: torch.Tensor,
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
+    apply_router_weight_on_input: bool,
 ) -> torch.Tensor:
-    layer = get_layer_from_name(_resolve_layer_name(layer_name))
-    quant_method = layer.quant_method
-    moe_kernel = quant_method.moe_kernel
-    assert moe_kernel is not None
-    disable_expert_map = getattr(quant_method, "disable_expert_map", False)
-    return moe_kernel.apply(
-        hidden_states=hidden_states,
-        w1=layer.w13_weight,
-        w2=layer.w2_weight,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        activation=layer.activation,
-        global_num_experts=layer.global_num_experts,
-        apply_router_weight_on_input=layer.apply_router_weight_on_input,
-        expert_map=None if disable_expert_map else layer.expert_map,
+    impl = _get_modular_impl_from_name(
+        _resolve_layer_name(layer_name),
+        advance_moe_layer_index=False,
+    )
+    output = torch.empty_like(hidden_states)
+    return impl._finalize(
+        output,
+        fused_out,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        apply_router_weight_on_input,
         shared_experts_input=shared_experts_input,
     )
 
 
-def _moe_modular_apply_fake(
+def _moe_modular_finalize_fake(
+    fused_out: torch.Tensor,
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
+    apply_router_weight_on_input: bool,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
 
 direct_register_custom_op(
-    op_name="moe_modular_apply",
-    op_func=_moe_modular_apply,
-    fake_impl=_moe_modular_apply_fake,
+    op_name="moe_modular_prepare",
+    op_func=_moe_modular_prepare,
+    fake_impl=_moe_modular_prepare_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+direct_register_custom_op(
+    op_name="moe_modular_experts",
+    op_func=_moe_modular_experts,
+    fake_impl=_moe_modular_experts_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+direct_register_custom_op(
+    op_name="moe_modular_finalize",
+    op_func=_moe_modular_finalize,
+    fake_impl=_moe_modular_finalize_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
@@ -1431,6 +1563,154 @@ class FusedMoEKernelModularImpl:
 
         return output
 
+    def _use_stage_custom_ops(
+        self,
+        layer_name: str | None,
+        apply_router_weight_on_input: bool,
+    ) -> bool:
+        if (
+            layer_name is None
+            or envs.VLLM_FUSED_MOE_WRAP_MODE != "unwrapped"
+            or not torch.compiler.is_compiling()
+            or apply_router_weight_on_input
+        ):
+            return False
+        if (
+            self.inplace
+            or self.shared_experts is not None
+            or self.prepare_finalize.supports_async()
+        ):
+            return False
+        if (
+            self.prepare_finalize.__class__.__name__
+            != "MoEPrepareAndFinalizeNoDPEPModular"
+        ):
+            return False
+        return self.fused_experts.quant_config.quant_dtype is None
+
+    def _prepare_stage(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        layer_name: str | None,
+        use_stage_custom_ops: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        ExpertTokensMetadata | None,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        if use_stage_custom_ops:
+            assert layer_name is not None
+            topk_ids, topk_weights = torch.ops.vllm.moe_modular_prepare(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                _encode_layer_name(layer_name),
+                global_num_experts,
+                apply_router_weight_on_input,
+            )
+            return hidden_states, None, None, topk_ids, topk_weights
+        return self._prepare(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            global_num_experts,
+            expert_map,
+            apply_router_weight_on_input,
+        )
+
+    def _fused_experts_stage(
+        self,
+        in_dtype: torch.dtype,
+        a1q: torch.Tensor,
+        a1q_scale: torch.Tensor | None,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        expert_tokens_meta: ExpertTokensMetadata | None,
+        layer_name: str | None,
+        use_stage_custom_ops: bool,
+    ) -> torch.Tensor:
+        if use_stage_custom_ops:
+            assert layer_name is not None
+            assert a1q_scale is None
+            assert expert_tokens_meta is None
+            return torch.ops.vllm.moe_modular_experts(
+                a1q,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                _encode_layer_name(layer_name),
+                activation.value,
+                global_num_experts,
+                local_num_experts,
+                apply_router_weight_on_input,
+            )
+        return self._fused_experts(
+            in_dtype=in_dtype,
+            a1q=a1q,
+            a1q_scale=a1q_scale,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            local_num_experts=local_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            expert_tokens_meta=expert_tokens_meta,
+        )
+
+    def _finalize_stage(
+        self,
+        output: torch.Tensor | None,
+        fused_out: torch.Tensor,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        shared_experts_input: torch.Tensor | None,
+        layer_name: str | None,
+        use_stage_custom_ops: bool,
+    ) -> torch.Tensor:
+        if use_stage_custom_ops:
+            assert layer_name is not None
+            return torch.ops.vllm.moe_modular_finalize(
+                fused_out,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                shared_experts_input,
+                _encode_layer_name(layer_name),
+                apply_router_weight_on_input,
+            )
+        assert output is not None
+        return self._finalize(
+            output,
+            fused_out,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            apply_router_weight_on_input,
+            shared_experts_input=shared_experts_input,
+        )
+
     def apply(
         self,
         hidden_states: torch.Tensor,
@@ -1443,6 +1723,7 @@ class FusedMoEKernelModularImpl:
         expert_map: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         shared_experts_input: torch.Tensor | None = None,
+        layer_name: str | None = None,
     ) -> torch.Tensor:
         """
         This function computes a Mixture of Experts (MoE) layer using two sets
@@ -1471,10 +1752,17 @@ class FusedMoEKernelModularImpl:
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
+        use_stage_custom_ops = self._use_stage_custom_ops(
+            layer_name,
+            apply_router_weight_on_input,
+        )
+
         if self.inplace:
             assert self.shared_experts is None
             assert not disable_inplace()
             output = hidden_states
+        elif use_stage_custom_ops:
+            output = None
         else:
             output = torch.empty_like(hidden_states)
 
@@ -1482,16 +1770,20 @@ class FusedMoEKernelModularImpl:
         if global_num_experts == -1:
             global_num_experts = local_num_experts
 
-        a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            global_num_experts,
-            expert_map,
-            apply_router_weight_on_input,
+        a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = (
+            self._prepare_stage(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                global_num_experts,
+                expert_map,
+                apply_router_weight_on_input,
+                layer_name,
+                use_stage_custom_ops,
+            )
         )
 
-        fused_out = self._fused_experts(
+        fused_out = self._fused_experts_stage(
             in_dtype=hidden_states.dtype,
             a1q=a1q,
             a1q_scale=a1q_scale,
@@ -1505,9 +1797,11 @@ class FusedMoEKernelModularImpl:
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
+            layer_name=layer_name,
+            use_stage_custom_ops=use_stage_custom_ops,
         )
 
-        return self._finalize(
+        return self._finalize_stage(
             output,
             fused_out,
             hidden_states,
@@ -1515,6 +1809,8 @@ class FusedMoEKernelModularImpl:
             topk_ids,
             apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
+            layer_name=layer_name,
+            use_stage_custom_ops=use_stage_custom_ops,
         )
 
 
@@ -1711,6 +2007,7 @@ class FusedMoEKernel:
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         shared_experts_input: torch.Tensor | None = None,
+        layer_name: str | None = None,
     ) -> torch.Tensor:
         assert isinstance(self.impl, FusedMoEKernelModularImpl)
         return self.impl.apply(
@@ -1724,48 +2021,5 @@ class FusedMoEKernel:
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
-        )
-
-    def apply_compile_boundary(
-        self,
-        layer_name: str,
-        hidden_states: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        activation: MoEActivation,
-        global_num_experts: int,
-        expert_map: torch.Tensor | None,
-        apply_router_weight_on_input: bool,
-        shared_experts_input: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        assert isinstance(self.impl, FusedMoEKernelModularImpl)
-        if (
-            envs.VLLM_FUSED_MOE_WRAP_MODE == "unwrapped"
-            and torch.compiler.is_compiling()
-        ):
-            if self.impl.inplace:
-                raise NotImplementedError(
-                    "Unwrapped modular MoE compile boundary does not support "
-                    "in-place kernels yet."
-                )
-            return torch.ops.vllm.moe_modular_apply(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                shared_experts_input,
-                _encode_layer_name(layer_name),
-            )
-        return self.impl.apply(
-            hidden_states=hidden_states,
-            w1=w1,
-            w2=w2,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            shared_experts_input=shared_experts_input,
+            layer_name=layer_name,
         )
